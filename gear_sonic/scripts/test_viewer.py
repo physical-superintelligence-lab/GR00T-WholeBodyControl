@@ -2,8 +2,8 @@
 Live ZED-only viewer for zed_server.py.
 
 Subscribes to the server's dedicated viewer PUB stream (2-part multipart:
-[ego_jpeg, stereo_jpeg]) on port 5559. This is SEPARATE from the REP
-recording socket (5558), so running this viewer never slows down the
+[ego_jpeg, stereo_jpeg]) on port 5559. This is SEPARATE from the recording
+camera stream (5555), so running this viewer never slows down the
 recorder — PUB drops frames for a slow subscriber instead of backpressuring.
 Press 'q' or ESC to quit. Use --duration N to auto-exit after N seconds.
 Press 's' to dump the last --dump-seconds of received JPEGs (ego + stereo, raw

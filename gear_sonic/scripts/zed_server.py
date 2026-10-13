@@ -9,10 +9,14 @@ gear_sonic/scripts/run_data_exporter.py (msgpack, one message per frame):
 
   {"timestamps": {"ego_view": <capture time>}, "images": {"ego_view": <ZED left JPEG>}}
 
+Camera REP bind: tcp://*:5558, for inference clients (ZedNeckCamera). Each
+request gets the next new frame as a 2-part reply [ego_rgb_jpeg, ego_stereo_jpeg].
+Serve a single REQ client: several clients on one REP socket split the frames.
+
 Optional outputs:
   - H.264 TCP stream of ZED stereo to Pico VR (--enable-pico).
   - ZMQ PUB on tcp://*:5560 of neck motor present-position
-    `[yaw_rad, pitch_rad]`, for g1_data_server.py to record into data.json.
+    `[yaw_rad, pitch_rad]`, recorded by run_data_exporter.py --record-neck.
     Toggle via --neck-state-pub (default on, '' to disable).
 
 Usage (full pipeline, on the robot):
@@ -21,7 +25,7 @@ Usage (full pipeline, on the robot):
         --enable-neck-motor \
         --pose-zmq tcp://<DESKTOP_IP>:5570
 
-Environment overrides: CAMERA_PUB, ENABLE_PICO, PICO_IP, VIDEO_PORT,
+Environment overrides: CAMERA_PUB, ZMQ_BIND, ENABLE_PICO, PICO_IP, VIDEO_PORT,
                       ZED_RESOLUTION, ZED_FPS, VR_WIDTH, VR_HEIGHT,
                       POSE_ZMQ, NECK_MOTOR, NECK_STATE_PUB
 """
@@ -63,6 +67,7 @@ frame_cond = threading.Condition()
 
 # Defaults (overridden by CLI / env)
 CAMERA_PUB_DEFAULT = os.environ.get("CAMERA_PUB", "tcp://*:5555")
+ZMQ_BIND_DEFAULT = os.environ.get("ZMQ_BIND", "tcp://*:5558")
 PICO_IP = os.environ.get("PICO_IP", "192.168.0.128")
 VIDEO_PORT = int(os.environ.get("VIDEO_PORT", "12345"))
 VR_WIDTH = int(os.environ.get("VR_WIDTH", "0"))   # 0 = use native stereo size
@@ -222,6 +227,33 @@ def zed_capture_thread(cfg: Any) -> None:
         except Exception as e:
             print(f"[ZED] Capture error: {e}")
             time.sleep(0.01)
+
+
+def camera_rep_thread(cfg: Any) -> None:
+    """Answers inference-client frame requests on the REP socket. Each request
+    waits for a frame newer than the last one sent, so a single client gets
+    every frame; the other camera outputs track frames independently."""
+    if not getattr(cfg, "zmq_bind", ""):
+        return
+    try:
+        sock = zmq.Context.instance().socket(zmq.REP)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.bind(cfg.zmq_bind)
+        print(f"[ZMQ] Camera REP bound to {cfg.zmq_bind}")
+    except Exception as e:
+        print(f"\033[91m[ZMQ] Camera REP bind failed: {e}\033[0m")
+        return
+
+    last_seq = 0
+    while True:
+        sock.recv()
+        with frame_cond:
+            while frame_seq == last_seq:
+                frame_cond.wait(timeout=0.1)
+            enc_rgb = latest_ego_rgb_bytes
+            enc_stereo = latest_ego_stereo_bytes
+            last_seq = frame_seq
+        sock.send_multipart([enc_rgb or b"", enc_stereo or b""])
 
 
 def viewer_pub_thread(cfg: Any) -> None:
@@ -860,6 +892,11 @@ def _parse_args() -> argparse.Namespace:
 
     # Network
     p.add_argument(
+        "--zmq-bind",
+        default=ZMQ_BIND_DEFAULT,
+        help="ZMQ REP bind address for inference clients (default tcp://*:5558, '' to disable)",
+    )
+    p.add_argument(
         "--camera-pub",
         default=CAMERA_PUB_DEFAULT,
         help="ZMQ PUB bind address for the data exporter camera stream (default tcp://*:5555)",
@@ -901,6 +938,7 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.jpeg_rgb_quality = ns.jpeg_rgb_quality
     c.jpeg_stereo_quality = ns.jpeg_stereo_quality
     c.camera_pub = ns.camera_pub
+    c.zmq_bind = ns.zmq_bind
     c.viewer_pub = ns.viewer_pub
     c.enable_pico = ns.enable_pico
     c.pico_ip = ns.pico_ip
@@ -919,6 +957,9 @@ def start_server(cfg: Any) -> None:
     ).start()
     threading.Thread(
         target=viewer_pub_thread, args=(cfg,), daemon=True
+    ).start()
+    threading.Thread(
+        target=camera_rep_thread, args=(cfg,), daemon=True
     ).start()
 
     pico_streamer: Optional[PicoVideoStreamer] = None
