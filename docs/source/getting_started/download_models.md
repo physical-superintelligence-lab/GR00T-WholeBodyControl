@@ -20,8 +20,20 @@ From the repo root:
 # Deployment (ONNX models + planner → gear_sonic_deploy/)
 python download_from_hf.py
 
+# Low-latency teleoperation checkpoint (ONNX models + planner → gear_sonic_deploy/)
+python download_from_hf.py --low-latency
+
+# SONIC v1.1 checkpoint (ONNX models + planner → gear_sonic_deploy/)
+python download_from_hf.py --sonic-v1-1
+
 # Training (checkpoint + SMPL data → sonic_release/ + data/smpl_filtered/)
 python download_from_hf.py --training
+
+# Low-latency PyTorch checkpoint + config only
+python download_from_hf.py --training --low-latency
+
+# SONIC v1.1 PyTorch checkpoint + configs only
+python download_from_hf.py --training --sonic-v1-1 --no-smpl
 
 # Sample data only (1 walking sequence for quick testing)
 python download_from_hf.py --sample
@@ -32,6 +44,8 @@ python download_from_hf.py --training --no-smpl
 
 This downloads the **latest** policy encoder + decoder + kinematic planner into
 `gear_sonic_deploy/`, preserving the same directory layout the deployment binary expects.
+Each command first fetches the repository-level `config.json` release manifest
+and validates the selected model layout before downloading model files.
 
 ---
 
@@ -40,6 +54,8 @@ This downloads the **latest** policy encoder + decoder + kinematic planner into
 | Flag | Description |
 |------|-------------|
 | `--training` | Download training checkpoint + SMPL motion data (~30 GB) |
+| `--low-latency` | Download the low-latency teleoperation checkpoint. For deployment, ONNX files go to `gear_sonic_deploy/policy/low_latency/`; with `--training`, the PyTorch checkpoint and configs go to `low_latency/`. |
+| `--sonic-v1-1` | Download SONIC v1.1, which uses robot-heading-normalized targets and wrist-pose augmentation. Deployment files go to `gear_sonic_deploy/policy/sonic_v1_1/`; training files go to `sonic_v1_1/`. |
 | `--sample` | Download sample motion data only (~4 MB) |
 | `--no-planner` | Skip the kinematic planner download |
 | `--no-smpl` | With `--training`, skip SMPL data (checkpoint only) |
@@ -55,9 +71,195 @@ python download_from_hf.py
 # Policy only
 python download_from_hf.py --no-planner
 
+# Low-latency teleoperation policy only
+python download_from_hf.py --low-latency --no-planner
+
+# SONIC v1.1 policy only
+python download_from_hf.py --sonic-v1-1 --no-planner
+
 # Download into a custom directory
 python download_from_hf.py --output-dir /data/gear-sonic
 ```
+
+---
+
+## Low-Latency Teleoperation Checkpoint
+
+The checkpoint published under `low_latency/` in
+[`nvidia/GEAR-SONIC`](https://huggingface.co/nvidia/GEAR-SONIC) is configured
+for responsive whole-body teleoperation. Its SMPL encoder uses **4 future
+reference frames**, compared with **10 frames** in the default release. At
+50 Hz (20 ms per frame), this reduces SMPL reference lookahead from
+approximately **200 ms to 80 ms**.
+
+This is the controller's reference lookahead, not a measurement of total
+end-to-end system latency. The checkpoint does not replace the default
+top-level deployment policy.
+
+Download the deployment ONNX files:
+
+```bash
+python download_from_hf.py --low-latency
+```
+
+This creates:
+
+```
+gear_sonic_deploy/
+└── policy/low_latency/
+    ├── model_encoder.onnx
+    ├── model_decoder.onnx
+    └── observation_config.yaml
+```
+
+### C++ deployment inference
+
+Run the low-latency ONNX controller in simulation:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    sim
+```
+
+Run it for VLA or teleoperation on the real robot:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+`deploy.sh` expects `--cp` to be the shared model prefix; it appends
+`_encoder.onnx` and `_decoder.onnx` internally. The low-latency PyTorch
+checkpoint is available as `low_latency/last.pt`:
+
+```bash
+python download_from_hf.py --training --low-latency
+```
+
+### Python inference and evaluation
+
+For Python-side checkpoint evaluation in Isaac Lab, download the PyTorch
+checkpoint and sample motions:
+
+```bash
+python download_from_hf.py --training --low-latency
+python download_from_hf.py --sample
+```
+
+Then run the low-latency checkpoint with `eval_agent_trl.py`:
+
+```bash
+python gear_sonic/eval_agent_trl.py \
+    +checkpoint=low_latency/last.pt \
+    +headless=False \
+    ++num_envs=1 \
+    ++manager_env.observations.policy.enable_corruption=False \
+    ++manager_env.observations.tokenizer.enable_corruption=False \
+    "++manager_env.commands.motion.motion_lib_cfg.motion_file=sample_data/robot_filtered" \
+    "++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=sample_data/smpl_filtered"
+```
+
+For the Python VLA tmux launcher, pass the same low-latency C++ deploy files
+through launcher flags:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+The launcher still runs the ONNX controller through the C++ deployment pane;
+the Python process coordinates the VLA client, camera client, keyboard control,
+and optional data exporter.
+
+---
+
+## SONIC v1.1 Checkpoint
+
+The checkpoint under `sonic_v1_1/` uses robot-heading-normalized target
+orientations and was trained with wrist-pose augmentation. It is intended for
+heading-stable whole-body teleoperation and SONIC-backed VLA policies trained
+against this controller.
+
+Its SMPL and wrist encoders use **10 future frames at 20 ms spacing**
+(approximately **200 ms** of reference lookahead). G1 and teleoperation
+references use 10 frames at `step5`. This is not the low-latency checkpoint.
+
+Download the matching ONNX encoder, decoder, observation config, and planner:
+
+```bash
+python download_from_hf.py --sonic-v1-1
+```
+
+This creates:
+
+```
+gear_sonic_deploy/
+└── policy/sonic_v1_1/
+    ├── model_encoder.onnx
+    ├── model_decoder.onnx
+    └── observation_config.yaml
+```
+
+Run the controller in simulation:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/sonic_v1_1/model \
+    --obs-config policy/sonic_v1_1/observation_config.yaml \
+    --motor-kp-scale 4,10=1.5 \
+    --motor-kd-scale 4,10=1.5 \
+    sim
+```
+
+The gain settings are the tested v1.1 hardware tuning. Indices `4` and `10`
+refer to the left and right ankle-pitch motors; the change improves whole-body
+stability and observed wrist tracking. They remain explicit so other model
+variants retain their original gains.
+
+For the VLA launcher:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/sonic_v1_1/model \
+    --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
+    --deploy-motor-kp-scale 4,10=1.5 \
+    --deploy-motor-kd-scale 4,10=1.5 \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+Download the PyTorch checkpoint and configs without the shared 30 GB SMPL
+dataset:
+
+```bash
+python download_from_hf.py --training --sonic-v1-1 --no-smpl
+```
+
+Evaluate it with the matching release recipe:
+
+```bash
+python gear_sonic/eval_agent_trl.py \
+    +exp=manager/universal_token/all_modes/sonic_v1_1 \
+    +checkpoint=sonic_v1_1/last.pt \
+    +headless=False \
+    ++num_envs=1 \
+    ++manager_env.observations.policy.enable_corruption=False \
+    ++manager_env.observations.tokenizer.enable_corruption=False
+```
+
+Use the same `+exp` and `+checkpoint` values with `train_agent_trl.py` for
+continued training.
 
 ---
 
@@ -70,6 +272,7 @@ pip install huggingface_hub[cli]
 
 # Policy only
 hf download nvidia/GEAR-SONIC \
+    config.json \
     model_encoder.onnx \
     model_decoder.onnx \
     observation_config.yaml \
@@ -88,14 +291,16 @@ from huggingface_hub import hf_hub_download
 
 REPO_ID = "nvidia/GEAR-SONIC"
 
+manifest = hf_hub_download(repo_id=REPO_ID, filename="config.json")
 encoder = hf_hub_download(repo_id=REPO_ID, filename="model_encoder.onnx")
 decoder = hf_hub_download(repo_id=REPO_ID, filename="model_decoder.onnx")
-config  = hf_hub_download(repo_id=REPO_ID, filename="observation_config.yaml")
+obs_config = hf_hub_download(repo_id=REPO_ID, filename="observation_config.yaml")
 planner = hf_hub_download(repo_id=REPO_ID, filename="planner_sonic.onnx")
 
+print("Release manifest:", manifest)
 print("Policy encoder :", encoder)
 print("Policy decoder :", decoder)
-print("Obs config     :", config)
+print("Obs config     :", obs_config)
 print("Planner        :", planner)
 ```
 
@@ -109,6 +314,7 @@ The SONIC release training checkpoint and config are also available on Hugging F
 
 ```bash
 hf download nvidia/GEAR-SONIC \
+    config.json \
     sonic_release/last.pt \
     sonic_release/config.yaml \
     --local-dir models
@@ -121,11 +327,13 @@ from huggingface_hub import hf_hub_download
 
 REPO_ID = "nvidia/GEAR-SONIC"
 
+manifest = hf_hub_download(repo_id=REPO_ID, filename="config.json")
 checkpoint = hf_hub_download(repo_id=REPO_ID, filename="sonic_release/last.pt")
-config = hf_hub_download(repo_id=REPO_ID, filename="sonic_release/config.yaml")
+training_config = hf_hub_download(repo_id=REPO_ID, filename="sonic_release/config.yaml")
 
+print("Manifest   :", manifest)
 print("Checkpoint :", checkpoint)
-print("Config     :", config)
+print("Config     :", training_config)
 ```
 
 ### Evaluate the checkpoint
@@ -147,11 +355,13 @@ A small sample dataset (1 walking sequence) is included for quick testing withou
 ```bash
 # Sample data only
 hf download nvidia/GEAR-SONIC \
+    --include "config.json" \
     --include "sample_data/*" \
     --local-dir .
 
 # Sample data + training checkpoint
 hf download nvidia/GEAR-SONIC \
+    --include "config.json" \
     --include "sample_data/*" \
     --include "sonic_release/*" \
     --local-dir .
@@ -194,7 +404,10 @@ The SMPL retargeted motion data used for training (131K sequences, filtered from
 
 ```bash
 # Download all parts
-hf download nvidia/GEAR-SONIC --include "bones_seed_smpl/*" --local-dir .
+hf download nvidia/GEAR-SONIC \
+    --include "config.json" \
+    --include "bones_seed_smpl/*" \
+    --local-dir .
 
 # Reassemble and extract
 cat bones_seed_smpl/bones_seed_smpl.tar.part_* | tar xf - -C data/
@@ -218,10 +431,25 @@ python gear_sonic/train_agent_trl.py \
 
 ```
 nvidia/GEAR-SONIC/
+├── config.json                       # Release manifest and model layout
 ├── model_encoder.onnx                # Policy encoder (ONNX, for deployment)
 ├── model_decoder.onnx                # Policy decoder (ONNX, for deployment)
 ├── observation_config.yaml           # Observation configuration (deployment)
 ├── planner_sonic.onnx                # Kinematic planner (ONNX)
+├── low_latency/
+│   ├── model_encoder.onnx            # Low-latency policy encoder (ONNX)
+│   ├── model_decoder.onnx            # Low-latency policy decoder (ONNX)
+│   ├── observation_config.yaml       # Low-latency observation configuration
+│   ├── last.pt                       # Low-latency training checkpoint
+│   ├── config.yaml                   # Low-latency training config
+│   └── model_config.yaml             # Low-latency model config
+├── sonic_v1_1/
+│   ├── model_encoder.onnx            # SONIC v1.1 policy encoder (ONNX)
+│   ├── model_decoder.onnx            # SONIC v1.1 policy decoder (ONNX)
+│   ├── observation_config.yaml       # Matching deployment observations
+│   ├── last.pt                       # SONIC v1.1 training checkpoint
+│   ├── config.yaml                   # Resolved training config
+│   └── model_config.yaml             # Model architecture config
 ├── bones_seed_smpl/                  # SMPL motion data (131K sequences, ~30GB split tar)
 │   ├── bones_seed_smpl.tar.part_aa
 │   ├── ...
@@ -240,6 +468,14 @@ The download script places deployment files into the layout the deployment binar
 ```
 gear_sonic_deploy/
 ├── policy/release/
+│   ├── model_encoder.onnx
+│   ├── model_decoder.onnx
+│   └── observation_config.yaml
+├── policy/low_latency/
+│   ├── model_encoder.onnx
+│   ├── model_decoder.onnx
+│   └── observation_config.yaml
+├── policy/sonic_v1_1/
 │   ├── model_encoder.onnx
 │   ├── model_decoder.onnx
 │   └── observation_config.yaml

@@ -850,6 +850,12 @@ class ManagerEnvWrapper:
             except Exception:  # noqa: S110, BLE001
                 pass
 
+        if self.motion_command is not None and hasattr(
+            self.motion_command, "capture_adaptive_cursor_snapshot"
+        ):
+            # Capture after all between-step cursor mutations and immediately
+            # before Isaac Lab can reset/resample terminated environments.
+            self.motion_command.capture_adaptive_cursor_snapshot()
         obs_dict, rew, terminated, truncated, extras = self.env.step(env_actions)
 
         # compute dones for compatibility with RSL-RL

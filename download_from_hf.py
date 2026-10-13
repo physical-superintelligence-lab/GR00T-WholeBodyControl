@@ -6,6 +6,8 @@ Repository: https://huggingface.co/nvidia/GEAR-SONIC
 
 Usage:
     python download_from_hf.py                    # ONNX models for deployment
+    python download_from_hf.py --low-latency      # Low-latency ONNX models
+    python download_from_hf.py --sonic-v1-1       # SONIC v1.1 ONNX models
     python download_from_hf.py --training          # PyTorch checkpoint + SMPL data
     python download_from_hf.py --sample            # Sample data only (quick start)
     python download_from_hf.py --output-dir /path  # custom output directory
@@ -13,6 +15,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -20,6 +23,8 @@ import sys
 from pathlib import Path
 
 REPO_ID = "nvidia/GEAR-SONIC"
+RELEASE_MANIFEST_FILE = "config.json"
+RELEASE_MANIFEST_SCHEMA_VERSION = 1
 
 # (filename in HF repo, local destination relative to output_dir)
 POLICY_FILES = [
@@ -28,11 +33,38 @@ POLICY_FILES = [
     ("observation_config.yaml", "policy/release/observation_config.yaml"),
 ]
 
+LOW_LATENCY_POLICY_FILES = [
+    ("low_latency/model_encoder.onnx", "policy/low_latency/model_encoder.onnx"),
+    ("low_latency/model_decoder.onnx", "policy/low_latency/model_decoder.onnx"),
+    ("low_latency/observation_config.yaml", "policy/low_latency/observation_config.yaml"),
+]
+
+SONIC_V1_1_POLICY_FILES = [
+    ("sonic_v1_1/model_encoder.onnx", "policy/sonic_v1_1/model_encoder.onnx"),
+    ("sonic_v1_1/model_decoder.onnx", "policy/sonic_v1_1/model_decoder.onnx"),
+    (
+        "sonic_v1_1/observation_config.yaml",
+        "policy/sonic_v1_1/observation_config.yaml",
+    ),
+]
+
 PLANNER_FILE = ("planner_sonic.onnx", "planner/target_vel/V2/planner_sonic.onnx")
 
 TRAINING_FILES = [
     ("sonic_release/last.pt", "sonic_release/last.pt"),
     ("sonic_release/config.yaml", "sonic_release/config.yaml"),
+]
+
+LOW_LATENCY_TRAINING_FILES = [
+    ("low_latency/last.pt", "low_latency/last.pt"),
+    ("low_latency/config.yaml", "low_latency/config.yaml"),
+    ("low_latency/model_config.yaml", "low_latency/model_config.yaml"),
+]
+
+SONIC_V1_1_TRAINING_FILES = [
+    ("sonic_v1_1/last.pt", "sonic_v1_1/last.pt"),
+    ("sonic_v1_1/config.yaml", "sonic_v1_1/config.yaml"),
+    ("sonic_v1_1/model_config.yaml", "sonic_v1_1/model_config.yaml"),
 ]
 
 SMPL_TAR_PARTS_PREFIX = "bones_seed_smpl/bones_seed_smpl.tar.part_"
@@ -62,6 +94,28 @@ def parse_args():
         action="store_true",
         help="Download training checkpoint + SMPL motion data (~30 GB)",
     )
+    variant_group = parser.add_mutually_exclusive_group()
+    variant_group.add_argument(
+        "--low-latency",
+        action="store_true",
+        help=(
+            "Download the low-latency SONIC variant. For deployment, files are "
+            "placed under gear_sonic_deploy/policy/low_latency/. With --training, "
+            "downloads low_latency/last.pt and its configs."
+        ),
+    )
+    variant_group.add_argument(
+        "--sonic-v1-1",
+        dest="sonic_v1_1",
+        action="store_true",
+        help=(
+            "Download the SONIC v1.1 teleoperation variant with "
+            "robot-heading-normalized targets and "
+            "wrist-pose augmentation. For deployment, files are placed under "
+            "gear_sonic_deploy/policy/sonic_v1_1/. With --training, downloads "
+            "sonic_v1_1/last.pt and its configs."
+        ),
+    )
     parser.add_argument(
         "--sample",
         action="store_true",
@@ -88,6 +142,71 @@ def _ensure_huggingface_hub():
         print("huggingface_hub is not installed. Install it with:")
         print("  pip install huggingface_hub")
         sys.exit(1)
+
+
+def load_release_manifest(hf_hub_download, repo_id, token=None):
+    """Download and validate the repository-level release manifest."""
+    print(f"  Downloading {RELEASE_MANIFEST_FILE} ...", flush=True)
+    cached = hf_hub_download(
+        repo_id=repo_id,
+        filename=RELEASE_MANIFEST_FILE,
+        token=token,
+    )
+    try:
+        manifest = json.loads(Path(cached).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {RELEASE_MANIFEST_FILE}: {exc}") from exc
+
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{RELEASE_MANIFEST_FILE} must contain a JSON object")
+    if manifest.get("schema_version") != RELEASE_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported {RELEASE_MANIFEST_FILE} schema_version: "
+            f"{manifest.get('schema_version')!r}"
+        )
+    if manifest.get("model_id") != repo_id:
+        raise ValueError(
+            f"{RELEASE_MANIFEST_FILE} model_id is {manifest.get('model_id')!r}, "
+            f"expected {repo_id!r}"
+        )
+
+    print(
+        f"  -> validated schema {manifest['schema_version']} for {manifest['model_id']}"
+    )
+    return manifest
+
+
+def validate_variant_files(manifest, variant, group, expected_entries):
+    """Ensure a downloader file group matches the published release manifest."""
+    try:
+        actual_files = manifest["variants"][variant][group]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"{RELEASE_MANIFEST_FILE} is missing variants.{variant}.{group}"
+        ) from exc
+
+    expected_files = [remote_path for remote_path, _ in expected_entries]
+    if actual_files != expected_files:
+        raise ValueError(
+            f"{RELEASE_MANIFEST_FILE} variants.{variant}.{group} does not match "
+            f"this downloader: expected {expected_files!r}, got {actual_files!r}"
+        )
+
+
+def validate_shared_value(manifest, key, expected_value):
+    """Ensure shared release metadata matches the downloader contract."""
+    try:
+        actual_value = manifest["shared_files"][key]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"{RELEASE_MANIFEST_FILE} is missing shared_files.{key}"
+        ) from exc
+
+    if actual_value != expected_value:
+        raise ValueError(
+            f"{RELEASE_MANIFEST_FILE} shared_files.{key} does not match this "
+            f"downloader: expected {expected_value!r}, got {actual_value!r}"
+        )
 
 
 def download_file(hf_hub_download, repo_id, hf_filename, local_dest, token=None):
@@ -170,7 +289,20 @@ def download_sample_data(snapshot_download, repo_id, output_dir, token=None):
 
 def main():
     args = parse_args()
+    if args.sample and (args.low_latency or args.sonic_v1_1):
+        print(
+            "ERROR: model variant flags cannot be combined with --sample",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     hf_hub_download, snapshot_download = _ensure_huggingface_hub()
+    if args.low_latency:
+        variant = "low_latency"
+    elif args.sonic_v1_1:
+        variant = "sonic_v1_1"
+    else:
+        variant = "default"
 
     repo_root = Path(__file__).resolve().parent
 
@@ -184,12 +316,47 @@ def main():
     print(f"  Repository : {REPO_ID}")
     print(f"  Output dir : {output_dir}")
     if args.training:
-        print(f"  Mode       : training (checkpoint + SMPL data)")
+        print(f"  Mode       : {variant.replace('_', '-')} training checkpoint")
     elif args.sample:
         print(f"  Mode       : sample data (quick start)")
     else:
-        print(f"  Mode       : deployment (ONNX models)")
+        print(f"  Mode       : {variant.replace('_', '-')} deployment (ONNX models)")
     print("=" * 60)
+
+    print("\n[Release Manifest]")
+    try:
+        manifest = load_release_manifest(
+            hf_hub_download, REPO_ID, token=args.token
+        )
+        if args.sample:
+            validate_shared_value(manifest, "sample_data_prefix", "sample_data/")
+        elif args.training:
+            training_files = {
+                "default": TRAINING_FILES,
+                "low_latency": LOW_LATENCY_TRAINING_FILES,
+                "sonic_v1_1": SONIC_V1_1_TRAINING_FILES,
+            }[variant]
+            validate_variant_files(
+                manifest, variant, "training_files", training_files
+            )
+            if not args.low_latency and not args.no_smpl:
+                validate_shared_value(
+                    manifest, "smpl_archive_parts", SMPL_TAR_PARTS
+                )
+        else:
+            policy_files = {
+                "default": POLICY_FILES,
+                "low_latency": LOW_LATENCY_POLICY_FILES,
+                "sonic_v1_1": SONIC_V1_1_POLICY_FILES,
+            }[variant]
+            validate_variant_files(
+                manifest, variant, "deployment_files", policy_files
+            )
+            if not args.no_planner:
+                validate_shared_value(manifest, "planner", PLANNER_FILE[0])
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if args.sample:
         print("\n[Sample Data]")
@@ -197,13 +364,15 @@ def main():
 
     elif args.training:
         print("\n[Checkpoint]")
-        for hf_filename, local_rel in TRAINING_FILES:
+        for hf_filename, local_rel in training_files:
             download_file(
                 hf_hub_download, REPO_ID, hf_filename,
                 output_dir / local_rel, token=args.token,
             )
 
-        if not args.no_smpl:
+        if args.low_latency:
+            print("\n[SMPL Motion Data] Skipped (not part of low-latency checkpoint download)")
+        elif not args.no_smpl:
             print("\n[SMPL Motion Data]")
             download_and_extract_smpl(hf_hub_download, REPO_ID, output_dir, token=args.token)
         else:
@@ -211,7 +380,7 @@ def main():
 
     else:
         print("\n[Policy]")
-        for hf_filename, local_rel in POLICY_FILES:
+        for hf_filename, local_rel in policy_files:
             download_file(
                 hf_hub_download, REPO_ID, hf_filename,
                 output_dir / local_rel, token=args.token,

@@ -21,10 +21,12 @@ modality. Training uses PPO with auxiliary losses in Isaac Lab simulation.
 | Config | Encoders | Use case |
 |--------|----------|----------|
 | `sonic_release` | G1, teleop, SMPL | **Default** — matches the released checkpoint |
+| `sonic_v1_1` | G1, teleop, SMPL | SONIC v1.1 with heading-normalized targets and wrist-pose augmentation |
 | `sonic_bones_seed` | G1, teleop, SMPL, SOMA | Extended training with SOMA skeleton encoder |
 
 Use `sonic_release` for finetuning and evaluation. The `sonic_bones_seed`
 config adds a fourth SOMA encoder (see [Training with SOMA](#training-with-soma-encoder)).
+Use `sonic_v1_1` with `sonic_v1_1/last.pt`.
 
 ## Data Processing
 
@@ -112,6 +114,17 @@ python gear_sonic/train_agent_trl.py \
     ++manager_env.commands.motion.motion_lib_cfg.motion_file=<path/to/robot_filtered> \
     ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=<path/to/smpl_filtered>
 ```
+
+### Adaptive sampling attribution
+
+Adaptive sampling is enabled by default. A terminated environment is charged
+to the motion ID and frame bin it tracked during physics, before Isaac Lab
+resamples the environment. This prevents failures from being assigned to the
+newly drawn motion.
+
+After a few hundred iterations, `adp_samp/failure_rate_max` should separate
+from `adp_samp/failure_rate_mean`; values that remain nearly identical are a
+strong signal that failures are still being attributed after reset.
 
 ### Multi-GPU and multi-node training
 

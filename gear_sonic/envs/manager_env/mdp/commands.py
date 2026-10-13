@@ -240,6 +240,12 @@ class TrackingCommand(CommandTerm):
             self.max_num_load_motions = max_num_load_motions
         self.motion_lib.load_motions_for_training(max_num_seqs=self.max_num_load_motions)
         self.use_adaptive_sampling = self.motion_lib.use_adaptive_sampling
+        # Isaac Lab resamples terminated environments before _update_command
+        # reads the cursor. Keep the pre-physics cursor so failures are charged
+        # to the motion/bin that was actually being tracked.
+        self._adp_prev_motion_ids = None
+        self._adp_prev_cursor = None
+        self._adp_snapshot_valid = False
 
         # Load contact data for contact-based initialization
         self._load_contact_data()
@@ -737,6 +743,14 @@ class TrackingCommand(CommandTerm):
         inst.metrics = {}
 
         return inst
+
+    def capture_adaptive_cursor_snapshot(self):
+        """Capture the cursor tracked by the next physics step."""
+        if not self.use_adaptive_sampling:
+            return
+        self._adp_prev_motion_ids = self.motion_ids.clone()
+        self._adp_prev_cursor = self.motion_start_time_steps + self.time_steps
+        self._adp_snapshot_valid = True
 
     def set_is_evaluating(self, is_evaluating: bool = True):
         """Toggle evaluation mode, which disables reset randomizations."""
@@ -3211,10 +3225,14 @@ class TrackingCommand(CommandTerm):
         """
         if self.use_adaptive_sampling:
             with common.Timer("update_adaptive_sampling"):
-                cur_time_steps = self.motion_start_time_steps + self.time_steps
-                self.motion_lib.update_adaptive_sampling(
-                    self._env.reset_terminated, self.motion_ids, cur_time_steps
-                )
+                if self._adp_snapshot_valid:
+                    self.motion_lib.update_adaptive_sampling(
+                        self._env.reset_terminated,
+                        self._adp_prev_motion_ids,
+                        self._adp_prev_cursor,
+                    )
+                    # A snapshot is valid for exactly one physics step.
+                    self._adp_snapshot_valid = False
         self.time_steps += 1
         env_ids = torch.where(
             self.time_steps + self.motion_start_time_steps

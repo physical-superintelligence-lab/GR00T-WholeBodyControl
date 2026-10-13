@@ -246,7 +246,42 @@ TENSORRT_MOUNT=""
 ADDITIONAL_MOUNTS=""
 DEVICE_MOUNTS=""
 
-if [ -n "$TensorRT_ROOT" ] && [ -d "$TensorRT_ROOT" ]; then
+if [[ "$SYSTEM_TYPE" == "jetson" ]] && [ -f "/usr/lib/aarch64-linux-gnu/libnvinfer.so" ]; then
+    # Prefer system TensorRT from JetPack - it's built without hard DLA deps,
+    # avoiding link errors from the standalone TensorRT tar download.
+    # Stage only TensorRT files (not libc etc.) via hard links + local symlinks.
+    TENSORRT_STAGING="/tmp/tensorrt-stage-$$"
+    rm -rf "$TENSORRT_STAGING"
+    mkdir -p "$TENSORRT_STAGING/lib" "$TENSORRT_STAGING/include"
+
+    # Hard-link real .so files, create relative symlinks for the .so/.so.N names
+    for pattern in libnvinfer libnvinfer_plugin libnvinfer_builder_resource \
+                   libnvinfer_dispatch libnvinfer_lean libnvinfer_vc_plugin \
+                   libnvonnxparser; do
+        for f in /usr/lib/aarch64-linux-gnu/${pattern}.so*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            if [ -L "$f" ]; then
+                # Recreate symlink with relative target
+                target=$(basename "$(readlink "$f")")
+                ln -sf "$target" "$TENSORRT_STAGING/lib/$base"
+            else
+                # Hard-link actual file
+                ln "$f" "$TENSORRT_STAGING/lib/$base" 2>/dev/null || cp "$f" "$TENSORRT_STAGING/lib/$base"
+            fi
+        done
+    done
+
+    # Copy headers
+    TENSORRT_INCLUDE_DIR="/usr/include/aarch64-linux-gnu"
+    [ -f "$TENSORRT_INCLUDE_DIR/NvInfer.h" ] || TENSORRT_INCLUDE_DIR="/usr/include"
+    for hdr in "$TENSORRT_INCLUDE_DIR"/Nv*.h; do
+        [ -f "$hdr" ] && ln "$hdr" "$TENSORRT_STAGING/include/" 2>/dev/null || cp "$hdr" "$TENSORRT_STAGING/include/"
+    done
+
+    echo "✅ Using system TensorRT from JetPack (staged to $TENSORRT_STAGING)"
+    TENSORRT_MOUNT="-v $TENSORRT_STAGING:/opt/TensorRT:ro"
+elif [ -n "$TensorRT_ROOT" ] && [ -d "$TensorRT_ROOT" ]; then
     echo "✅ TensorRT found: $TensorRT_ROOT (mounting to container)"
     TENSORRT_MOUNT="-v $TensorRT_ROOT:/opt/TensorRT:ro"
 else
@@ -257,8 +292,14 @@ fi
 if [[ "$SYSTEM_TYPE" == "jetson" ]]; then
     # Jetson: Add system library mounts
     if [ -n "$TENSORRT_MOUNT" ]; then
-        # Mount NVIDIA DLA libraries from host
-        ADDITIONAL_MOUNTS="-v /usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/nvidia:ro"
+        # NVIDIA container toolkit ≥1.18 (shipped with JetPack 6+) auto-injects
+        # everything in /usr/lib/aarch64-linux-gnu/nvidia/ via its drivers.csv,
+        # including libcuda.so.1 → libcuda.so symlinks created by a createContainer
+        # hook. A manual `-v ...:ro` mount shadows the toolkit's writable overlay
+        # and breaks the symlink hook with "read-only file system" — verified on
+        # both Thor (JP7) and Orin NX (JP6 with toolkit 1.19+). Skip the mount
+        # and let the runtime do its job.
+        : # ADDITIONAL_MOUNTS stays empty
 
         # Mount host CUDA toolkit (Jetson commonly needs libcudla with cudla* symbols)
         # Avoid hardcoding CUDA versions (JetPack 5/6 differ); pick newest cuda-* that has targets/aarch64-linux/lib.
@@ -362,15 +403,17 @@ fi
 docker run -it --rm \
     --name "$IMAGE_NAME" \
     --network host \
+    --ipc host \
     $GPU_SETTINGS \
     -v "$(cd .. && pwd):/workspace/g1_deploy:rw" \
+    -v "$(cd ../.. && pwd)/gear_sonic:/workspace/gear_sonic:rw" \
     $TENSORRT_MOUNT \
     $ADDITIONAL_MOUNTS \
     $DEVICE_MOUNTS \
     -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     -e ROS_DOMAIN_ID=0 \
     -e NVIDIA_VISIBLE_DEVICES=all \
-    -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    -e NVIDIA_DRIVER_CAPABILITIES=all \
     -e SYSTEM_TYPE="$SYSTEM_TYPE" \
     -e IS_JETSON="$IS_JETSON" \
     -e JETSON_MODEL="$JETSON_MODEL" \

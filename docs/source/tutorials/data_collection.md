@@ -10,6 +10,8 @@ Everything runs **offboard on your workstation** except the **camera server**, w
 ```{admonition} Supported cameras
 :class: note
 The tested and supported camera setup uses **Luxonis OAK cameras** (OAK-D, OAK-1, etc.). This includes a head/ego-view OAK camera and optional OAK wrist cameras. Other camera drivers (RealSense, USB webcam) are included in the codebase but have not been tested recently.
+
+A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under [`hardware/camera_mount/`](https://github.com/NVlabs/GR00T-WholeBodyControl/blob/main/hardware/camera_mount/README.md) — see its README for print settings, the bill of materials, and how it mounts on the G1.
 ```
 
 ```{admonition} Prerequisites
@@ -276,6 +278,8 @@ Common options:
 | `--deploy-obs-config` | *(default)* | Custom observation config for deploy.sh |
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
+| `--deploy-motor-kp-scale` | *(disabled)* | Hardware motor Kp scale specification forwarded to deploy.sh |
+| `--deploy-motor-kd-scale` | *(disabled)* | Hardware motor Kd scale specification forwarded to deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
 | `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
 

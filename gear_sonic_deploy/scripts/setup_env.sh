@@ -206,7 +206,11 @@ if [ -n "$TensorRT_ROOT" ]; then
         
         # CRITICAL: Add DLA library path for runtime (this is why your executable can't run)
         export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:$LD_LIBRARY_PATH"
-        echo "   📁 Added DLA library path to current session"
+        # Also add to LIBRARY_PATH so the build-time linker finds -lcudla here.
+        # GCC/ld doesn't search ldconfig paths for -l resolution by default; LIBRARY_PATH
+        # is the build-time analogue of LD_LIBRARY_PATH and feeds directly into -L search.
+        export LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:${LIBRARY_PATH:-}"
+        echo "   📁 Added DLA library path to current session (runtime + build-time)"
         
         # Make it persistent so you don't need to run setup_env.sh every time
         if ! grep -q "/usr/lib/aarch64-linux-gnu/nvidia" ~/.bashrc 2>/dev/null; then

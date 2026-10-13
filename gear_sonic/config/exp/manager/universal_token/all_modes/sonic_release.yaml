@@ -105,4 +105,3 @@ algo:
         decoders:
           g1_kin:
             outputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
-       

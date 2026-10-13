@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "model_id": "nvidia/GEAR-SONIC",
+  "model_name": "GEAR-SONIC",
+  "embodiment": "Unitree G1",
+  "control_frequency_hz": 50,
+  "token_dimension": 64,
+  "variants": {
+    "default": {
+      "display_name": "Default SONIC",
+      "description": "Original general-purpose SONIC whole-body controller.",
+      "smpl_reference": {
+        "future_frames": 10,
+        "frame_interval_ms": 20,
+        "lookahead_ms": 200
+      },
+      "deployment_files": [
+        "model_encoder.onnx",
+        "model_decoder.onnx",
+        "observation_config.yaml"
+      ],
+      "training_files": [
+        "sonic_release/last.pt",
+        "sonic_release/config.yaml"
+      ]
+    },
+    "low_latency": {
+      "display_name": "Low-latency teleoperation",
+      "description": "Whole-body teleoperation controller with a shorter SMPL reference horizon.",
+      "smpl_reference": {
+        "future_frames": 4,
+        "frame_interval_ms": 20,
+        "lookahead_ms": 80
+      },
+      "deployment_files": [
+        "low_latency/model_encoder.onnx",
+        "low_latency/model_decoder.onnx",
+        "low_latency/observation_config.yaml"
+      ],
+      "training_files": [
+        "low_latency/last.pt",
+        "low_latency/config.yaml",
+        "low_latency/model_config.yaml"
+      ]
+    },
+    "sonic_v1_1": {
+      "display_name": "SONIC v1.1",
+      "description": "Whole-body teleoperation controller with robot-heading-normalized targets and wrist-pose augmentation.",
+      "smpl_reference": {
+        "future_frames": 10,
+        "frame_interval_ms": 20,
+        "lookahead_ms": 200
+      },
+      "deployment_files": [
+        "sonic_v1_1/model_encoder.onnx",
+        "sonic_v1_1/model_decoder.onnx",
+        "sonic_v1_1/observation_config.yaml"
+      ],
+      "training_files": [
+        "sonic_v1_1/last.pt",
+        "sonic_v1_1/config.yaml",
+        "sonic_v1_1/model_config.yaml"
+      ]
+    }
+  },
+  "shared_files": {
+    "planner": "planner_sonic.onnx",
+    "sample_data_prefix": "sample_data/",
+    "smpl_archive_parts": [
+      "bones_seed_smpl/bones_seed_smpl.tar.part_aa",
+      "bones_seed_smpl/bones_seed_smpl.tar.part_ab",
+      "bones_seed_smpl/bones_seed_smpl.tar.part_ac",
+      "bones_seed_smpl/bones_seed_smpl.tar.part_ad",
+      "bones_seed_smpl/bones_seed_smpl.tar.part_ae",
+      "bones_seed_smpl/bones_seed_smpl.tar.part_af",
+      "bones_seed_smpl/bones_seed_smpl.tar.part_ag"
+    ]
+  }
+}

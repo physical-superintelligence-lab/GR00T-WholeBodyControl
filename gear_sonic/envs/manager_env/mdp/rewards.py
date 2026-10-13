@@ -52,6 +52,7 @@ class RewardsCfg:
     tracking_vr_5point_local = None
     motion_5point_local_pos = None
     feet_acc = None
+    energy_consumption = None
     is_terminated = None
     upright_penalty = None
 
@@ -245,6 +246,19 @@ def tracking_local_vr_2wrists_ori_error(
 
     error = quat_error_magnitude(ref_wrist_quat_local, robot_wrist_quat_local) ** 2
     return torch.exp(-error.mean(-1) / std**2)
+
+
+def energy_consumption(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize instantaneous mechanical power across the robot joints."""
+    if isinstance(asset_cfg, dict):
+        robot_name = asset_cfg.get("name", "robot")
+    else:
+        robot_name = getattr(asset_cfg, "name", "robot")
+    robot = env.scene[robot_name]
+    return torch.abs(robot.data.applied_torque * robot.data.joint_vel).sum(dim=-1)
 
 
 def tracking_local_head_ori_error(

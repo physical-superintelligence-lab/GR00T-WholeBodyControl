@@ -46,7 +46,8 @@ gear_sonic/config/
 │   └── trl_ppo_aux.yaml         # Trainer config (PPO with aux losses)
 ├── callbacks/                   # Training callbacks (save, eval, W&B, resample)
 └── exp/manager/universal_token/all_modes/
-    └── sonic_release.yaml       # Experiment config (overrides all of the above)
+    ├── sonic_release.yaml       # Original release experiment config
+    └── sonic_v1_1.yaml          # SONIC v1.1 experiment config
 ```
 
 The experiment config (`sonic_release.yaml`) sits at the top and overrides
@@ -206,6 +207,7 @@ sampled more frequently:
 | Config | Encoders | Use case |
 |--------|----------|----------|
 | `sonic_release` | G1, teleop, SMPL | Default — matches the released checkpoint |
+| `sonic_v1_1` | G1, teleop, SMPL | SONIC v1.1 with heading-normalized targets and wrist-pose augmentation |
 | `sonic_bones_seed` | G1, teleop, SMPL, SOMA | Extended training with SOMA skeleton encoder |
 | `sonic_h2` | G1, teleop, SMPL | H2 robot (31 DOF) |
 

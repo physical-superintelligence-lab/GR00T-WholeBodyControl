@@ -212,6 +212,8 @@ show_usage() {
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --default-motion NAME   Set the default motion to load on startup"
+    echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
+    echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -254,6 +256,8 @@ INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
 DEFAULT_MOTION_NAME="$DEFAULT_MOTION_NAME_DEFAULT"
+MOTOR_KP_SCALES=()
+MOTOR_KD_SCALES=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -326,6 +330,22 @@ while [[ $# -gt 0 ]]; do
             DEFAULT_MOTION_NAME="$2"
             shift 2
             ;;
+        --motor-kp-scale)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --motor-kp-scale requires <motor-list>=<factor>${NC}" >&2
+                exit 1
+            fi
+            MOTOR_KP_SCALES+=("$2")
+            shift 2
+            ;;
+        --motor-kd-scale)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --motor-kd-scale requires <motor-list>=<factor>${NC}" >&2
+                exit 1
+            fi
+            MOTOR_KD_SCALES+=("$2")
+            shift 2
+            ;;
         sim|real)
             INTERFACE_MODE="$1"
             shift
@@ -391,12 +411,18 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # ZMQ_HOST is already set from argument parsing above
 
 # Additional flags for simulation mode
-EXTRA_ARGS=""
+EXTRA_ARGS=()
 if [[ "$ENV_TYPE" == "sim" ]]; then
-    EXTRA_ARGS="--disable-crc-check"
+    EXTRA_ARGS+=("--disable-crc-check")
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
 fi
+for scale in "${MOTOR_KP_SCALES[@]}"; do
+    EXTRA_ARGS+=("--motor-kp-scale" "$scale")
+done
+for scale in "${MOTOR_KD_SCALES[@]}"; do
+    EXTRA_ARGS+=("--motor-kd-scale" "$scale")
+done
 
 # ============================================================================
 # Step 1: Check Prerequisites
@@ -527,8 +553,9 @@ echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
 echo -e "  Default Motion:     ${GREEN}$DEFAULT_MOTION_NAME${NC}"
-if [[ -n "$EXTRA_ARGS" ]]; then
-echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+printf -v EXTRA_ARGS_DISPLAY ' %q' "${EXTRA_ARGS[@]}"
+echo -e "  Extra Args:         ${GREEN}${EXTRA_ARGS_DISPLAY# }${NC}"
 fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -543,8 +570,8 @@ echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST \\${NC}"
 echo -e "${BLUE}    --default-motion $DEFAULT_MOTION_NAME${NC}"
-if [[ -n "$EXTRA_ARGS" ]]; then
-echo -e "${BLUE}    $EXTRA_ARGS${NC}"
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+echo -e "${BLUE}    ${EXTRA_ARGS_DISPLAY# }${NC}"
 fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -572,26 +599,15 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     # Run the binary directly instead of via `just run`: just installs its own
     # SIGINT handling and kills the recipe on Ctrl-C, defeating the trap above.
     # The command is otherwise identical (the `run` recipe is a plain passthrough).
-    if [[ -n "$EXTRA_ARGS" ]]; then
-        ./target/release/g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST" \
-            --default-motion "$DEFAULT_MOTION_NAME" \
-            $EXTRA_ARGS
-    else
-        ./target/release/g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST" \
-            --default-motion "$DEFAULT_MOTION_NAME"
-    fi
+    ./target/release/g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+        --obs-config "$OBS_CONFIG" \
+        --encoder-file "$CHECKPOINT_ENCODER" \
+        --planner-file "$PLANNER" \
+        --input-type "$INPUT_TYPE" \
+        --output-type "$OUTPUT_TYPE" \
+        --zmq-host "$ZMQ_HOST" \
+        --default-motion "$DEFAULT_MOTION_NAME" \
+        "${EXTRA_ARGS[@]}"
 else
     echo ""
     echo -e "${YELLOW}Deployment cancelled.${NC}"

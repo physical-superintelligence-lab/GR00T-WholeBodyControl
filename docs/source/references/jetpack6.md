@@ -115,4 +115,12 @@ sudo jetson_clocks
 sudo jetson_clocks --show  
 ```
 
-to check if it is already in Maxn model. 
+to check if it is already in Maxn model.
+
+## 6. Install Required JetPack Packages
+
+Install the packages needed for deployment:
+
+```
+sudo apt-get install -y nvidia-l4t-dla-compiler libcudla-dev-12-6
+```

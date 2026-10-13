@@ -113,6 +113,12 @@ class InferenceLaunchConfig:
     deploy_output_type: str = ""
     """Output type for deploy.sh. Leave empty for default."""
 
+    deploy_motor_kp_scale: str = ""
+    """Kp scale specification for hardware motor indices (for example, 4,10=1.5)."""
+
+    deploy_motor_kd_scale: str = ""
+    """Kd scale specification for hardware motor indices (for example, 4,10=1.5)."""
+
     # VLA inference options
     policy_host: str = "localhost"
     """Isaac-GR00T PolicyServer host."""
@@ -320,6 +326,10 @@ def main(config: InferenceLaunchConfig):
         deploy_cmd += f"--motion-data {config.deploy_motion_data} "
     if config.deploy_output_type:
         deploy_cmd += f"--output-type {config.deploy_output_type} "
+    if config.deploy_motor_kp_scale:
+        deploy_cmd += f"--motor-kp-scale {config.deploy_motor_kp_scale} "
+    if config.deploy_motor_kd_scale:
+        deploy_cmd += f"--motor-kd-scale {config.deploy_motor_kd_scale} "
     deploy_cmd += deploy_mode
 
     print("Starting C++ deploy (pane 0)...")

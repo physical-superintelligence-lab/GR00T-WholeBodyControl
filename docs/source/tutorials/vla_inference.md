@@ -74,6 +74,90 @@ See [Data Collection](data_collection.md) for camera server setup.
 
 The `gear_sonic_deploy` binary must be built. See the main README.
 
+### SONIC v1.1 Checkpoint
+
+Use the `sonic_v1_1/` checkpoint when the VLA policy was trained against
+the robot-heading-normalized SONIC controller. It uses a 10-frame SMPL/wrist
+reference horizon and was trained with wrist-pose augmentation. It is not the
+low-latency checkpoint.
+
+```bash
+python download_from_hf.py --sonic-v1-1
+```
+
+Launch the matching C++ controller:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/sonic_v1_1/model \
+    --obs-config policy/sonic_v1_1/observation_config.yaml \
+    --input-type zmq_manager \
+    --motor-kp-scale 4,10=1.5 \
+    --motor-kd-scale 4,10=1.5 \
+    real
+```
+
+This v1.1 tuning scales the left and right ankle-pitch motors (hardware
+indices `4` and `10`). The resulting whole-body stability improves observed
+wrist tracking; it does not directly scale the wrist motors.
+
+Or pass the same model pair to the Python launcher:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/sonic_v1_1/model \
+    --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
+    --deploy-motor-kp-scale 4,10=1.5 \
+    --deploy-motor-kd-scale 4,10=1.5 \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+### Low-Latency Teleoperation Checkpoint
+
+The `low_latency/` checkpoint is configured for responsive whole-body
+teleoperation. Its SMPL encoder uses 4 future reference frames at 50 Hz
+(approximately 80 ms of reference lookahead), compared with 10 frames
+(approximately 200 ms) in the default release. This is reference lookahead,
+not total end-to-end system latency.
+
+Download the deployment files from Hugging Face:
+
+```bash
+python download_from_hf.py --low-latency
+```
+
+Then launch `gear_sonic_deploy` with the low-latency model prefix and matching
+observation config:
+
+**C++ deploy:**
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+For simulation, replace `real` with `sim`. The `--cp` value is a model prefix:
+`deploy.sh` appends `_encoder.onnx` and `_decoder.onnx` internally.
+
+**Python launcher:**
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+The Python launcher starts the same C++ deploy command in a tmux pane, then runs
+the Python VLA inference client, keyboard publisher, and optional data exporter.
+
 ## Action Space
 
 The Sonic embodiment (`unitree_g1_sonic`) uses a 78-dimensional action
@@ -160,6 +244,27 @@ cd gear_sonic_deploy
 ./deploy.sh --input-type zmq_manager real
 ```
 
+Low-latency variant:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the apple"
+```
+
+Manual C++ deploy equivalent:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
 ### Terminal 3 — VLA Inference
 
 ```bash
@@ -202,6 +307,8 @@ python gear_sonic/scripts/run_data_exporter.py \
 ### tmux Launcher (`launch_inference.py`)
 
 The launcher exposes all the above flags plus deploy and data exporter options.
+Use `--deploy-motor-kp-scale` and `--deploy-motor-kd-scale` to forward hardware
+gain specifications to the C++ controller.
 Run `python gear_sonic/scripts/launch_inference.py --help` for the full list.
 
 ## Remote PolicyServer
