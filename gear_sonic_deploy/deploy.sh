@@ -535,7 +535,7 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "${YELLOW}The following command will be executed:${NC}"
 echo ""
-echo -e "${BLUE}just run g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
+echo -e "${BLUE}./target/release/g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
 echo -e "${BLUE}    --obs-config $OBS_CONFIG \\${NC}"
 echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
@@ -562,11 +562,18 @@ read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
 if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
+    echo -e "${YELLOW}📋 Ctrl-C is disabled from here on; stop the robot with the 'o' key.${NC}"
     echo ""
-    
-    # Build the command with optional extra args
+
+    # Ignore SIGINT so an accidental Ctrl-C in this terminal cannot kill the
+    # control loop. Stopping is done via the 'o' key or an external `kill`.
+    trap '' INT
+
+    # Run the binary directly instead of via `just run`: just installs its own
+    # SIGINT handling and kills the recipe on Ctrl-C, defeating the trap above.
+    # The command is otherwise identical (the `run` recipe is a plain passthrough).
     if [[ -n "$EXTRA_ARGS" ]]; then
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+        ./target/release/g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
             --obs-config "$OBS_CONFIG" \
             --encoder-file "$CHECKPOINT_ENCODER" \
             --planner-file "$PLANNER" \
@@ -576,7 +583,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --default-motion "$DEFAULT_MOTION_NAME" \
             $EXTRA_ARGS
     else
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+        ./target/release/g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
             --obs-config "$OBS_CONFIG" \
             --encoder-file "$CHECKPOINT_ENCODER" \
             --planner-file "$PLANNER" \
