@@ -5,6 +5,8 @@ All data sources use ZMQ:
   1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (port 5557, from C++ zmq_output_handler)
   2. SMPL pose    -> ZMQ SUB on ``pose`` topic     (port 5556, from pico_manager_thread_server)
   3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
+  4. Neck (opt.)  -> ZMQ SUB on neck command (port 5570, from pico_manager_thread_server)
+                     and neck state (port 5560, from zed_server.py on the robot)
 
 Robot config (``script_config`` in info.json) is read from the ``robot_config``
 ZMQ topic re-published every ~2 s by the C++ process.  If the config is not
@@ -35,12 +37,15 @@ from gear_sonic.data.features_sonic_vla import (
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
+    get_neck_features,
+    get_neck_modality_config,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
+from gear_sonic.utils.data_collection.neck_subscriber import ZMQNeckSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity, quat_to_rot6d
@@ -79,6 +84,12 @@ class SonicDataExporterConfig:
     camera_port: int = 5555
     """Camera server port."""
 
+    ego_view_height: int = 480
+    """Ego-view image height (must match the camera server, e.g. 376 for ZED VGA)."""
+
+    ego_view_width: int = 640
+    """Ego-view image width (must match the camera server, e.g. 672 for ZED VGA)."""
+
     # ZMQ: Sonic / SMPL pose (from pico_manager_thread_server)
     sonic_zmq_host: str = "localhost"
     """ZMQ host for Sonic SMPL pose messages."""
@@ -99,6 +110,22 @@ class SonicDataExporterConfig:
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+
+    # Neck (2-DOF yaw/pitch)
+    record_neck: bool = False
+    """Record neck command (action.neck) and neck motor state (observation.neck_state)."""
+
+    neck_cmd_zmq_host: str = "localhost"
+    """ZMQ host for the neck command stream (pico_manager_thread_server)."""
+
+    neck_cmd_zmq_port: int = 5570
+    """ZMQ port for the neck command stream."""
+
+    neck_state_zmq_host: str = "localhost"
+    """ZMQ host for the neck motor state stream (zed_server.py on the robot)."""
+
+    neck_state_zmq_port: int = 5560
+    """ZMQ port for the neck motor state stream."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -227,6 +254,11 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        record_neck: bool = False,
+        neck_cmd_zmq_host: str = "localhost",
+        neck_cmd_zmq_port: int = 5570,
+        neck_state_zmq_host: str = "localhost",
+        neck_state_zmq_port: int = 5560,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -254,6 +286,15 @@ class GrootDataCollector:
             host=state_zmq_host,
             port=state_zmq_port,
         )
+
+        self._record_neck = record_neck
+        self._neck_cmd_subscriber = None
+        self._neck_state_subscriber = None
+        if record_neck:
+            self._neck_cmd_subscriber = ZMQNeckSubscriber(neck_cmd_zmq_host, neck_cmd_zmq_port)
+            self._neck_state_subscriber = ZMQNeckSubscriber(
+                neck_state_zmq_host, neck_state_zmq_port
+            )
 
         self._sonic_zmq_ctx = None
         self._sonic_zmq_socket = None
@@ -606,6 +647,9 @@ class GrootDataCollector:
 
         self._add_cpp_state_features(frame_data, proprio)
 
+        if self._record_neck:
+            self._add_neck_features(frame_data)
+
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
 
         self._add_images_to_frame_data(frame_data)
@@ -663,6 +707,14 @@ class GrootDataCollector:
             frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
         else:
             frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+
+    def _add_neck_features(self, frame_data: dict) -> None:
+        """Neck command and measured motor angles; zeros until first received."""
+        zeros = np.zeros(2, dtype=np.float64)
+        neck_cmd = self._neck_cmd_subscriber.get_latest()
+        neck_state = self._neck_state_subscriber.get_latest()
+        frame_data["action.neck"] = neck_cmd if neck_cmd is not None else zeros
+        frame_data["observation.neck_state"] = neck_state if neck_state is not None else zeros
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
@@ -840,10 +892,16 @@ class GrootDataCollector:
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
-        try:
-            self._state_subscriber.close()
-        except Exception:
-            pass
+        for subscriber in [
+            self._state_subscriber,
+            self._neck_cmd_subscriber,
+            self._neck_state_subscriber,
+        ]:
+            if subscriber is not None:
+                try:
+                    subscriber.close()
+                except Exception:
+                    pass
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -913,6 +971,11 @@ def main(config: SonicDataExporterConfig):
 
     dataset_features = get_features_sonic_vla(g1_rm)
     modality_config = get_modality_config_sonic_vla(g1_rm)
+    dataset_features["observation.images.ego_view"]["shape"] = [
+        config.ego_view_height,
+        config.ego_view_width,
+        3,
+    ]
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -923,6 +986,12 @@ def main(config: SonicDataExporterConfig):
                 modality_config[key].update(value)
             else:
                 modality_config[key] = value
+
+    if config.record_neck:
+        print("[Neck] Neck recording enabled — adding to dataset schema")
+        dataset_features.update(get_neck_features())
+        for key, value in get_neck_modality_config().items():
+            modality_config[key].update(value)
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
@@ -936,7 +1005,11 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "record_neck": config.record_neck,
+        },
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1023,11 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        record_neck=config.record_neck,
+        neck_cmd_zmq_host=config.neck_cmd_zmq_host,
+        neck_cmd_zmq_port=config.neck_cmd_zmq_port,
+        neck_state_zmq_host=config.neck_state_zmq_host,
+        neck_state_zmq_port=config.neck_state_zmq_port,
     )
     data_collector.run()
 

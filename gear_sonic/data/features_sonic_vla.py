@@ -395,6 +395,34 @@ def get_wrist_camera_modality_config() -> dict:
     }
 
 
+def get_neck_features() -> dict:
+    """Features for the optional 2-DOF neck (added when ``record_neck`` is enabled)."""
+    return {
+        "observation.neck_state": {
+            "dtype": "float64",
+            "shape": (2,),
+            "names": ["neck_yaw", "neck_pitch"],
+        },
+        "action.neck": {
+            "dtype": "float64",
+            "shape": (2,),
+            "names": ["neck_yaw", "neck_pitch"],
+        },
+    }
+
+
+def get_neck_modality_config() -> dict:
+    """Modality config entries for the optional 2-DOF neck."""
+    return {
+        "state": {
+            "neck": {"start": 0, "end": 2, "original_key": "observation.neck_state"},
+        },
+        "action": {
+            "neck": {"start": 0, "end": 2, "original_key": "action.neck"},
+        },
+    }
+
+
 def get_g1_robot_model(
     waist_location: Literal[
         "lower_body", "upper_body", "lower_and_upper_body"

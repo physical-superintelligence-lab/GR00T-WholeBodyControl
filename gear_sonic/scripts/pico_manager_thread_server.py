@@ -24,8 +24,11 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import json
 import os
+import queue
 import subprocess
+import sys
 import threading
 import time
 
@@ -95,6 +98,8 @@ try:
 except ImportError:
     print("Warning: get_g1_key_frame_poses not available (pyvista may not be installed).")
     get_g1_key_frame_poses = None
+
+from gear_sonic.utils.teleop.neck.neck_retarget import pico_head_to_neck
 
 
 class LocomotionMode(IntEnum):
@@ -1800,6 +1805,75 @@ class PlannerStreamer:
         self.last_send = time.time()
 
 
+class NeckPublisher:
+    """Publishes 2-DOF neck `[yaw, pitch]` JSON (radians) at up to 50 Hz for
+    zed_server.py --pose-zmq.
+
+    Publishes (0, 0) instead of the head pose while any hold is active:
+      - reset_active: toggled from the terminal (r + Enter)
+      - not follow: the manager is in StreamMode.OFF
+    """
+
+    PORT = 5570
+    PUBLISH_HZ = 50.0
+    # Robot neck angle = operator head angle x RETARGET_SCALE, so small head
+    # turns give a wider view.
+    RETARGET_SCALE = 1.5
+
+    def __init__(self, context):
+        self.socket = context.socket(zmq.PUB)
+        self.socket.setsockopt(zmq.SNDHWM, 1)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.bind(f"tcp://*:{self.PORT}")
+        self.reset_active = False
+        self.follow = False
+        self._last_publish_time = 0.0
+        print(f"[Neck] PUB bound to port {self.PORT}")
+
+    def publish(self, body_poses_np):
+        now = time.time()
+        if now - self._last_publish_time < 1.0 / self.PUBLISH_HZ:
+            return
+        if self.reset_active or not self.follow:
+            yaw, pitch = 0.0, 0.0
+        else:
+            angles = pico_head_to_neck(body_poses_np)
+            if angles is None:
+                return
+            yaw, pitch = angles
+            yaw *= self.RETARGET_SCALE
+            pitch *= self.RETARGET_SCALE
+        self.socket.send(json.dumps([float(yaw), float(pitch)]).encode("utf-8"))
+        self._last_publish_time = now
+
+    def close(self):
+        self.socket.close()
+
+
+def _start_terminal_command_listener():
+    """Read terminal commands (one per line, submitted with Enter) on a daemon
+    thread. Returns a queue of stripped, lower-cased lines.
+
+    Reads the raw fd rather than sys.stdin: exit() closes sys.stdin, which
+    would deadlock against a thread blocked inside sys.stdin's reader."""
+    commands = queue.Queue()
+
+    def _loop():
+        fd = sys.stdin.fileno()
+        pending = b""
+        while True:
+            chunk = os.read(fd, 1024)
+            if not chunk:
+                return
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                commands.put(line.decode("utf-8", "replace").strip().lower())
+
+    threading.Thread(target=_loop, daemon=True, name="terminal-commands").start()
+    return commands
+
+
 def run_pico_manager(
     port: int = 5556,
     buffer_size: int = 15,
@@ -1814,12 +1888,18 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    no_neck: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
+    Terminal input (type the key, then Enter):
+      ]: start policy (= A+B+X+Y in OFF)      Enter: toggle POSE/PLANNER (= A+X)
+      o: stop policy (= A+B+X+Y)               s or q: toggle recording (= left grip + A)
+      d: discard recording (= left grip + B)
+      r: neck hold at (0, 0) on/off
     """
     if xrt is None:
         raise ImportError(
@@ -1878,6 +1958,14 @@ def run_pico_manager(
         zmq_feedback_port=zmq_feedback_port,
     )
 
+    neck = None if no_neck else NeckPublisher(context)
+
+    terminal_commands = _start_terminal_command_listener()
+    print(
+        "Terminal controls (key + Enter): ']'=start policy, Enter=toggle POSE/PLANNER, "
+        "'o'=stop policy, 's'/'q'=toggle recording, 'd'=discard recording, 'r'=neck hold"
+    )
+
     # State machine diagram:
     #
     #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
@@ -1921,6 +2009,20 @@ def run_pico_manager(
 
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+
+            # Terminal commands act as one-tick button presses. ']' only starts and
+            # 'o' only stops, so a stray key cannot flip the A+B+X+Y toggle.
+            commands = set()
+            while not terminal_commands.empty():
+                commands.add(terminal_commands.get_nowait())
+            is_off = current_mode == StreamMode.OFF
+            start_combo = start_combo or ("]" in commands and is_off) or ("o" in commands and not is_off)
+            ax_pressed = ax_pressed or "" in commands
+            toggle_dc_cmd = "s" in commands or "q" in commands
+            toggle_da_cmd = "d" in commands
+            if "r" in commands and neck is not None:
+                neck.reset_active = not neck.reset_active
+                print(f"[Neck] Hold at (0, 0): {'ON' if neck.reset_active else 'OFF'}")
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -2038,11 +2140,17 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
+            # Neck follows the head in every mode except OFF.
+            if neck is not None:
+                neck.follow = current_mode != StreamMode.OFF
+                latest_sample = reader.get_latest()
+                neck.publish(latest_sample["body_poses_np"] if latest_sample is not None else None)
+
             # Mode-independent: send manager_state for data exporter
             toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
             toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
-            toggle_dc = toggle_dc_tmp and not prev_toggle_dc
-            toggle_da = toggle_da_tmp and not prev_toggle_da
+            toggle_dc = (toggle_dc_tmp and not prev_toggle_dc) or toggle_dc_cmd
+            toggle_da = (toggle_da_tmp and not prev_toggle_da) or toggle_da_cmd
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
             socket.send(
@@ -2068,6 +2176,8 @@ def run_pico_manager(
         reader.stop()
         three_point.close()
         socket.close()
+        if neck is not None:
+            neck.close()
         context.term()
         print("[Manager] Shutdown complete")
 
@@ -2156,6 +2266,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--no_neck",
+        action="store_true",
+        help="Do not publish neck [yaw, pitch] on port 5570 (--manager only)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2196,6 +2311,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            no_neck=args.no_neck,
         )
     else:
         # Run legacy single-thread pose streaming

@@ -213,6 +213,12 @@ class G1Deploy {
     std::shared_ptr<const MotionSequence> current_motion_ = nullptr;
     int current_frame_ = 0;
     int saved_frame_for_observation_window_ = 0; // for observation window
+
+    // For streaming mode: reduce observation window to lower latency.
+    // step5 requires 46 frames, but we clamp it to 10 for ~200ms latency instead of ~920ms.
+    // The extra frames will just repeat the last available frame (safe for streaming).
+    static constexpr int max_streaming_observation_window = 10;  // matches step1
+
     std::mutex current_motion_mutex_; // for current motion and frame synchronization
     
     // =========================================================================
@@ -298,7 +304,70 @@ class G1Deploy {
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
-    
+
+    // =========================================================================
+    // Smooth return-to-standing transition (ZMQ streaming toggled off)
+    // =========================================================================
+    // When external-token streaming stops, the encoder takes back over and would
+    // otherwise snap the reference to the standing pose, jerking the robot. Instead
+    // we feed the encoder a 1-frame reference whose joints ease from the robot's
+    // measured pose at exit toward the standing reference over ~1.5 s. The RL policy
+    // keeps running every tick (each tick is just a "hold this pose" command that
+    // drifts), so balance is maintained throughout.
+    static constexpr int RETURN_TRANSITION_STEPS = 75;  // ~1.5 s at 50 Hz
+    bool return_transition_pending_ = false;            // set on the streaming-exit edge
+    bool return_prev_streamed_ = false;                 // streamed-pose exit edge detector
+    bool return_transition_active_ = false;
+    int  return_transition_step_ = 0;
+    std::array<double, 29> return_transition_start_{};   // robot pose at exit (isaaclab order)
+    std::array<double, 29> return_transition_target_{};  // standing reference (isaaclab order)
+    MotionSequence::Point      return_transition_body_pos_{};
+    MotionSequence::Quaternion return_transition_body_quat_{};
+    std::shared_ptr<MotionSequence> return_transition_motion_;            // 1-frame live reference
+    std::shared_ptr<const MotionSequence> return_transition_static_ref_;  // restored when done
+
+    // =========================================================================
+    // Smooth teleop takeover: on the first streamed pose consumed by the
+    // encoder (protocol v1/v2/v3), lerp token_state_data_ from the standing
+    // token to the live token over ENTRY_TRANSITION_STEPS ticks, FSQ-quantized.
+    // Direct token streaming (protocol v4, replay/inference) is not blended.
+    // =========================================================================
+    static constexpr int ENTRY_TRANSITION_STEPS = 75;  // ~1.5 s at 50 Hz
+    static constexpr double FSQ_MIN = -0.625, FSQ_MAX = 0.625, FSQ_STEP = 0.0625;
+    bool entry_transition_active_ = false;
+    int  entry_transition_step_ = 0;
+    bool entry_prev_streamed_ = false;
+    std::vector<double> entry_transition_start_token_;
+
+    void StartEntryTransition(const char* source) {
+      entry_transition_start_token_.assign(token_state_data_.begin(), token_state_data_.end());
+      entry_transition_step_ = 0;
+      entry_transition_active_ = true;
+      std::cout << "[EntrySmooth] Blending " << source << " tokens over "
+                << ENTRY_TRANSITION_STEPS << " ticks." << std::endl;
+    }
+
+    // Blend token_state_data_ (holding the live token) toward the standing
+    // snapshot, FSQ-quantize, write back. Call once per control tick while active.
+    void BlendEntryToken() {
+      if (!entry_transition_active_) return;
+      double alpha = static_cast<double>(entry_transition_step_) /
+                     static_cast<double>(ENTRY_TRANSITION_STEPS);
+      alpha = std::clamp(alpha, 0.0, 1.0);
+      for (size_t i = 0; i < token_state_data_.size(); ++i) {
+        double v = (1.0 - alpha) * entry_transition_start_token_[i]
+                 + alpha * token_state_data_[i];
+        v = std::round(std::clamp(v, FSQ_MIN, FSQ_MAX) / FSQ_STEP) * FSQ_STEP;
+        token_state_data_[i] = std::clamp(v, FSQ_MIN, FSQ_MAX);
+      }
+      if (entry_transition_step_ >= ENTRY_TRANSITION_STEPS) {
+        entry_transition_active_ = false;
+        std::cout << "[EntrySmooth] Done, following live tokens." << std::endl;
+      } else {
+        entry_transition_step_++;
+      }
+    }
+
     // =========================================================================
     // Logging / recording streams
     // =========================================================================
@@ -429,7 +498,7 @@ class G1Deploy {
         std::cerr << "✗ Error: Motion has no bodies - cannot gather root z position" << std::endl;
         return false;
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather root z position from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
@@ -459,7 +528,7 @@ class G1Deploy {
         std::cerr << "✗ Error: Motion has no bodies - cannot gather body positions" << std::endl;
         return false;
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather positions from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
@@ -769,7 +838,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather positions from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
@@ -848,7 +917,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather velocities from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate frame index (current frame + frame_idx * step_size for future frames)
@@ -939,7 +1008,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       
       // Gather SMPL joints from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
@@ -999,7 +1068,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       
       // Gather SMPL poses from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
@@ -1670,6 +1739,18 @@ class G1Deploy {
         return false;
       }
 
+      // Smooth takeover edge (streamed pose): snapshot the standing token on the
+      // first tick the streamed motion is consumed, before it is overwritten.
+      const bool is_streamed = current_motion_ && current_motion_->name == "streamed";
+      if (is_streamed && !entry_prev_streamed_) {
+        StartEntryTransition("streamed-pose");
+      }
+      entry_prev_streamed_ = is_streamed;
+      if (!is_streamed && entry_transition_active_) {
+        entry_transition_active_ = false;
+        std::cout << "[EntrySmooth] Cancelled (streaming stopped)." << std::endl;
+      }
+
       // Gather encoder observations (populate encoder's internal input buffer)
       if (!GatherEncoderObservations()) {
         std::cerr << "✗ Error: Failed to gather encoder observations!" << std::endl;
@@ -1697,6 +1778,13 @@ class G1Deploy {
         const double v = static_cast<double>(token_buffer[i]);
         token_state_data_[i] = v;
         target_buffer[offset + i] = v;
+      }
+
+      if (entry_transition_active_) {
+        BlendEntryToken();
+        for (size_t i = 0; i < token_dim; ++i) {
+          target_buffer[offset + i] = token_state_data_[i];
+        }
       }
       return true;
     }
@@ -2642,6 +2730,17 @@ class G1Deploy {
     void LowStateHandler(const void* message) {
       LowState_ low_state = *(const LowState_*)message;
 
+      // Diagnostic: arrival gap is ~2 ms at 500 Hz; print only on anomalies.
+      {
+        static auto last_arrival = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double gap_ms = std::chrono::duration<double, std::milli>(now - last_arrival).count();
+        last_arrival = now;
+        if (gap_ms > 100.0) {
+          std::cout << "[Diag] LowState arrival gap: " << gap_ms << " ms" << std::endl;
+        }
+      }
+
       // Only perform CRC check if not disabled (for MuJoCo simulation compatibility)
       if (!disable_crc_check_) {
         uint32_t received_crc = low_state.crc();
@@ -3112,15 +3211,112 @@ class G1Deploy {
               }
             }
             
-          } else { 
+          } else {
             // if encoder mode is not -1, we need to turn on the encoder
             std::cout << "No encoder is used and not using external tokens" << std::endl;
             std::cout << "Turning on the encoder now" << std::endl;
             is_using_encoder_ = true;
+            // Falling edge of external-token streaming: the encoder is about to
+            // resume from the standing reference, which would snap the robot.
+            // Request a smooth return-to-standing transition instead.
+            return_transition_pending_ = true;
           }
         }
       }
       return true;
+    }
+
+    /**
+     * @brief Drive the smooth return-to-standing reference transition.
+     *
+     * Must be called once per CONTROL tick **with current_motion_mutex_ held**,
+     * before observation gathering. When `return_transition_pending_` is set
+     * (the moment external-token streaming stops and the encoder resumes), it
+     * snapshots the robot's measured joint pose and the standing reference, then
+     * builds a 1-frame reference motion. On every subsequent tick it eases that
+     * frame's joints from the measured pose toward the standing pose and points
+     * `current_motion_` at it, so the encoder produces a smoothly drifting token
+     * while the RL policy keeps balancing. When finished, the original standing
+     * reference is restored.
+     */
+    void UpdateReturnTransition() {
+      // Streamed-pose exit edge (protocol v1/v2/v3, encoder mode): toggling ZMQ
+      // streaming off swaps current_motion_ from the "streamed" motion back to a
+      // preloaded reference, which would snap the robot just like the token-stream
+      // exit. Detect that edge here and request the same smooth return. Safety
+      // resets swap to "temporary_motion" (freeze in place) and must not be
+      // redirected toward the standing pose.
+      const bool now_streamed = current_motion_ && current_motion_->name == "streamed";
+      if (return_prev_streamed_ && !now_streamed && is_using_encoder_ &&
+          current_motion_ && current_motion_->name != "temporary_motion") {
+        return_transition_pending_ = true;
+      }
+      return_prev_streamed_ = now_streamed;
+
+      // Cancel if streaming resumed (external tokens or streamed poses are driving again).
+      if ((return_transition_pending_ || return_transition_active_) && (!is_using_encoder_ || now_streamed)) {
+        return_transition_pending_ = false;
+        return_transition_active_ = false;
+        return_transition_motion_.reset();
+        return_transition_static_ref_.reset();
+        return;
+      }
+
+      if (return_transition_pending_) {
+        return_transition_pending_ = false;
+        const auto ls = low_state_buffer_.GetDataWithTime().data;
+        if (ls && current_motion_ && current_motion_->timesteps > 0) {
+          return_transition_static_ref_ = current_motion_;  // standing reference set on toggle-off
+          const double* ref0 = current_motion_->JointPositions(0);
+          for (int il = 0; il < 29; ++il) {
+            return_transition_target_[il] = ref0[il];
+            // robot measured pose (hardware/mujoco order) -> motion (isaaclab) order
+            return_transition_start_[il] = ls->motor_state()[mujoco_to_isaaclab[il]].q();
+          }
+          return_transition_body_pos_  = current_motion_->BodyPositions(0)[0];
+          return_transition_body_quat_ = current_motion_->BodyQuaternions(0)[0];
+
+          return_transition_motion_ = std::make_shared<MotionSequence>();
+          return_transition_motion_->name = "return_transition";
+          return_transition_motion_->ReserveCapacity(1, 29, 1, 1, 0, 0);
+          return_transition_motion_->timesteps = 1;
+          return_transition_motion_->SetEncodeMode(0);
+          return_transition_step_ = 0;
+          return_transition_active_ = true;
+          std::cout << "[ReturnTransition] Easing back to standing over "
+                    << RETURN_TRANSITION_STEPS << " ticks." << std::endl;
+        }
+      }
+
+      if (!return_transition_active_) {
+        return;
+      }
+
+      double alpha = static_cast<double>(return_transition_step_) /
+                     static_cast<double>(RETURN_TRANSITION_STEPS);
+      alpha = std::clamp(alpha, 0.0, 1.0);
+      double* jp = return_transition_motion_->JointPositions(0);
+      double* jv = return_transition_motion_->JointVelocities(0);
+      for (int il = 0; il < 29; ++il) {
+        jp[il] = (1.0 - alpha) * return_transition_start_[il] + alpha * return_transition_target_[il];
+        jv[il] = 0.0;
+      }
+      return_transition_motion_->BodyPositions(0)[0]   = return_transition_body_pos_;
+      return_transition_motion_->BodyQuaternions(0)[0] = return_transition_body_quat_;
+      current_motion_ = return_transition_motion_;
+      current_frame_ = 0;
+
+      if (return_transition_step_ >= RETURN_TRANSITION_STEPS) {
+        // Done: restore the original standing reference and clean up.
+        current_motion_ = return_transition_static_ref_;
+        current_frame_ = 0;
+        return_transition_active_ = false;
+        return_transition_motion_.reset();
+        return_transition_static_ref_.reset();
+        std::cout << "[ReturnTransition] Reached standing reference." << std::endl;
+      } else {
+        return_transition_step_++;
+      }
     }
 
     /**
@@ -3422,7 +3618,10 @@ class G1Deploy {
             std::cout << "Reset to frame 0." << std::endl;
           }
         } else {
-          if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
+          // if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
+          constexpr int kStreamWindowCap = 30;
+          const int eff_window = std::min(saved_frame_for_observation_window_, kStreamWindowCap);
+          if (current_frame_ >= current_motion_->timesteps - eff_window) {
             current_frame_ = current_frame_ - 1;
             std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;                    
           }
@@ -3939,6 +4138,9 @@ class G1Deploy {
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            // Smoothly ease the reference back to standing when ZMQ streaming
+            // was just toggled off (may swap current_motion_/current_frame_).
+            UpdateReturnTransition();
             current_frame_copy = current_frame_;
             current_motion_copy = current_motion_;
             current_encoder_mode_copy = current_motion_copy->GetEncodeMode();
