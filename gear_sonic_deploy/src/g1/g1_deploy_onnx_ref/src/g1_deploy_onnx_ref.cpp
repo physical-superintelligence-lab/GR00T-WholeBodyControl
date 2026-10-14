@@ -3289,8 +3289,12 @@ class G1Deploy {
       }
       return_prev_streamed_ = now_streamed;
 
-      // Cancel if streaming resumed (external tokens or streamed poses are driving again).
-      if ((return_transition_pending_ || return_transition_active_) && (!is_using_encoder_ || now_streamed)) {
+      // Cancel if streaming resumed (external tokens or streamed poses are driving
+      // again), or if the planner took over: it re-initializes from the measured
+      // pose and already returns to standing smoothly (zmq_manager mode).
+      const bool now_planner = current_motion_ && current_motion_->name == "planner_motion";
+      if ((return_transition_pending_ || return_transition_active_) &&
+          (!is_using_encoder_ || now_streamed || now_planner)) {
         return_transition_pending_ = false;
         return_transition_active_ = false;
         return_transition_motion_.reset();

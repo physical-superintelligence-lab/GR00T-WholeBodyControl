@@ -24,13 +24,16 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import atexit
 import json
 import os
 import queue
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 
 import msgpack
 import numpy as np
@@ -512,8 +515,9 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     middle = 10
     # Control thumb based on shoulder button state (index 4 is thumb tip)
     fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    # The solver's thumb-to-middle distance becomes (1 - trigger), so the grasp
+    # closes linearly with the trigger instead of snapping at 0.5.
+    fingertips[4 + middle, 0, 3] = float(np.clip(trigger, 0.0, 1.0))
 
     return fingertips
 
@@ -1573,13 +1577,15 @@ class PoseStreamer:
 def _init_input_source(
     input_source: str,
     buffer_size: int,
+    wait_for_body: bool = True,
 ) -> "PicoReader | input_readers.IsaacTeleopReader":
-    """Create, start, and wait for readiness of the requested teleop input source."""
+    """Create and start the requested teleop input source; with wait_for_body,
+    also block until the first body-tracking frame arrives."""
     if input_source == "isaac-teleop":
         reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size)
         reader.start()
         print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
-        while reader.get_latest() is None:
+        while wait_for_body and reader.get_latest() is None:
             print("waiting for Isaac Teleop body data (connect the headset to CloudXR)...")
             time.sleep(1)
         return reader
@@ -1592,7 +1598,7 @@ def _init_input_source(
     subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
     print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
+    while wait_for_body and not xrt.is_body_data_available():
         print("waiting for body data...")
         time.sleep(1)
 
@@ -1908,7 +1914,7 @@ class NeckPublisher:
 
     Publishes (0, 0) instead of the head pose while any hold is active:
       - reset_active: toggled from the terminal (r + Enter)
-      - not follow: the manager is in StreamMode.OFF
+      - not follow: teleop is not streaming (not POSE / POSE_PAUSE)
     """
 
     PORT = 5570
@@ -1948,24 +1954,26 @@ class NeckPublisher:
 
 
 def _start_terminal_command_listener():
-    """Read terminal commands (one per line, submitted with Enter) on a daemon
-    thread. Returns a queue of stripped, lower-cased lines.
+    """Read single-key terminal commands (no Enter needed) on a daemon thread.
+    Returns a queue of lower-cased keys; Enter is reported as "".
 
-    Reads the raw fd rather than sys.stdin: exit() closes sys.stdin, which
-    would deadlock against a thread blocked inside sys.stdin's reader."""
+    Puts the terminal in cbreak mode (restored at exit) and reads the raw fd
+    rather than sys.stdin: exit() closes sys.stdin, which would deadlock
+    against a thread blocked inside sys.stdin's reader."""
     commands = queue.Queue()
+    fd = sys.stdin.fileno()
+    if os.isatty(fd):
+        old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        atexit.register(termios.tcsetattr, fd, termios.TCSADRAIN, old_attrs)
 
     def _loop():
-        fd = sys.stdin.fileno()
-        pending = b""
         while True:
             chunk = os.read(fd, 1024)
             if not chunk:
                 return
-            pending += chunk
-            while b"\n" in pending:
-                line, pending = pending.split(b"\n", 1)
-                commands.put(line.decode("utf-8", "replace").strip().lower())
+            for ch in chunk.decode("utf-8", "replace"):
+                commands.put("" if ch in "\r\n" else ch.lower())
 
     threading.Thread(target=_loop, daemon=True, name="terminal-commands").start()
     return commands
@@ -1993,13 +2001,14 @@ def run_pico_manager(
     Controller input:
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
-    Terminal input (type the key, then Enter):
+    Terminal input (single key, no Enter needed):
       ]: start policy (= A+B+X+Y in OFF)      Enter: toggle POSE/PLANNER (= A+X)
-      o: stop policy (= A+B+X+Y)               s or q: toggle recording (= left grip + A)
+      s or q: toggle recording (= left grip + A)
       d: discard recording (= left grip + B)
       r: neck hold at (0, 0) on/off
     """
-    reader = _init_input_source(input_source, buffer_size)
+    # Do not block on body tracking, so the policy can be started before the Pico streams.
+    reader = _init_input_source(input_source, buffer_size, wait_for_body=False)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2047,8 +2056,8 @@ def run_pico_manager(
 
     terminal_commands = _start_terminal_command_listener()
     print(
-        "Terminal controls (key + Enter): ']'=start policy, Enter=toggle POSE/PLANNER, "
-        "'o'=stop policy, 's'/'q'=toggle recording, 'd'=discard recording, 'r'=neck hold"
+        "Terminal controls (single key): ']'=start policy, Enter=toggle POSE/PLANNER, "
+        "'s'/'q'=toggle recording, 'd'=discard recording, 'r'=neck hold"
     )
 
     # State machine diagram:
@@ -2071,6 +2080,9 @@ def run_pico_manager(
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
+    # False when the policy was started before Pico body data arrived; calibration
+    # then happens on the first POSE / VR_3PT entry instead.
+    vr_calibrated = False
     prev_toggle_dc = False
     prev_toggle_da = False
     try:
@@ -2095,13 +2107,13 @@ def run_pico_manager(
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
 
-            # Terminal commands act as one-tick button presses. ']' only starts and
-            # 'o' only stops, so a stray key cannot flip the A+B+X+Y toggle.
+            # Terminal commands act as one-tick button presses. ']' only starts, so a
+            # stray key cannot flip the A+B+X+Y toggle; stopping is left to deploy ('o').
             commands = set()
             while not terminal_commands.empty():
                 commands.add(terminal_commands.get_nowait())
             is_off = current_mode == StreamMode.OFF
-            start_combo = start_combo or ("]" in commands and is_off) or ("o" in commands and not is_off)
+            start_combo = start_combo or ("]" in commands and is_off)
             ax_pressed = ax_pressed or "" in commands
             toggle_dc_cmd = "s" in commands or "q" in commands
             toggle_da_cmd = "d" in commands
@@ -2118,8 +2130,9 @@ def run_pico_manager(
                     sample = reader.get_latest()
                     if sample is not None:
                         three_point.calibrate_now(sample["body_poses_np"])
+                        vr_calibrated = True
                     else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
+                        vr_calibrated = False
 
             elif current_mode == StreamMode.PLANNER:
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
@@ -2168,6 +2181,18 @@ def run_pico_manager(
                     new_mode = StreamMode.POSE
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
+
+            # Calibration deferred from policy start (no body data then): do it on
+            # the first POSE / VR_3PT entry.
+            if (
+                not vr_calibrated
+                and new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
+                and new_mode != current_mode
+            ):
+                sample = reader.get_latest()
+                if sample is not None:
+                    three_point.calibrate_now(sample["body_poses_np"])
+                    vr_calibrated = True
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
@@ -2225,9 +2250,10 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
-            # Neck follows the head in every mode except OFF.
+            # Neck follows the head only while teleop streams (POSE); otherwise it
+            # holds (0, 0), so disabling teleop returns it to center.
             if neck is not None:
-                neck.follow = current_mode != StreamMode.OFF
+                neck.follow = current_mode in (StreamMode.POSE, StreamMode.POSE_PAUSE)
                 latest_sample = reader.get_latest()
                 neck.publish(latest_sample["body_poses_np"] if latest_sample is not None else None)
 

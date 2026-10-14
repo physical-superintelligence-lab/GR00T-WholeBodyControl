@@ -163,7 +163,10 @@ def zed_capture_thread(cfg: Any) -> None:
 
     err = zed.open(init)
     if err != sl.ERROR_CODE.SUCCESS:
-        print(f"[ZED] Open failed: {repr(err)}. Ego capture thread exits.")
+        print(
+            f"\033[91m[ZED][ERROR] Camera open failed: {repr(err)}. "
+            "No ego frames will be published.\033[0m"
+        )
         return
 
     left_mat = sl.Mat()
@@ -178,6 +181,21 @@ def zed_capture_thread(cfg: Any) -> None:
 
     while True:
         try:
+            now = time.time()
+            if now - fps_t0 >= 5.0:
+                if fps_count == 0:
+                    print(
+                        f"\033[91m[ZED][ERROR] No frames captured in the last 5s "
+                        f"(grab errors: {grab_fails or 'none'})\033[0m"
+                    )
+                else:
+                    print(f"[ZED] capture {fps_count / (now - fps_t0):.1f} fps")
+                    if grab_fails:
+                        print(f"\033[93m[ZED] rejected frames (last 5s): {grab_fails}\033[0m")
+                grab_fails = {}
+                fps_t0 = now
+                fps_count = 0
+
             grab_err = zed.grab(runtime)
             if grab_err != sl.ERROR_CODE.SUCCESS:
                 key = repr(grab_err)
@@ -215,14 +233,6 @@ def zed_capture_thread(cfg: Any) -> None:
                 frame_cond.notify_all()
 
             fps_count += 1
-            now = time.time()
-            if now - fps_t0 >= 5.0:
-                print(f"[ZED] capture {fps_count / (now - fps_t0):.1f} fps")
-                if grab_fails:
-                    print(f"\033[93m[ZED] rejected frames (last 5s): {grab_fails}\033[0m")
-                    grab_fails = {}
-                fps_t0 = now
-                fps_count = 0
 
         except Exception as e:
             print(f"[ZED] Capture error: {e}")
