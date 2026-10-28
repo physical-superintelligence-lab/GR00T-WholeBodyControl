@@ -380,6 +380,13 @@ class ZMQManager : public InputInterface {
       }
     }
 
+    // Standing in planner mode with no locomotion (teleop disabled): keep the
+    // heading reference on the robot's measured heading, so a person can turn
+    // the robot and it keeps the new heading instead of turning back.
+    bool ContinuousHeadingUpdate() const override {
+      return active_mode_ == ManagedMode::PLANNER && planner_idle_;
+    }
+
     // Forward getters to pose interface when in streamed motion mode
     bool HasVR3PointControl() const override {
       if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
@@ -479,6 +486,7 @@ class ZMQManager : public InputInterface {
             // Planner was disabled, set initial movement state
             movement_state_buffer.SetData(MovementState(static_cast<int>(LocomotionMode::IDLE), 
                                                         {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f));
+            planner_idle_ = true;
 
             // Now enable planner
             planner_state.enabled = true;
@@ -611,6 +619,7 @@ class ZMQManager : public InputInterface {
           mode_state.movement_direction = normalize_vector_d(mode_state.movement_direction);
 
           movement_state_buffer.SetData(mode_state);
+          planner_idle_ = mode_state.locomotion_mode == static_cast<int>(LocomotionMode::IDLE);
           
           if constexpr (DEBUG_LOGGING) {
             std::cout << "[ZMQManager] Planner command: mode=" << latest_planner_message_.mode 
@@ -635,6 +644,7 @@ class ZMQManager : public InputInterface {
             -1.0f
           );
           movement_state_buffer.SetData(idle_state);
+          planner_idle_ = true;
           
           if (latest_planner_message_.timestamp != std::chrono::steady_clock::time_point{}) {
             std::cout << "[ZMQManager] Planner timeout (" 
@@ -1245,6 +1255,8 @@ class ZMQManager : public InputInterface {
 
     /// True once the planner has been initialised and is generating motions.
     bool is_planner_ready_ = false;
+    /// True while the commanded locomotion mode is IDLE (standing still).
+    bool planner_idle_ = true;
     /// True when transitioning from streamed-motion (teleop) back to planner mode;
     /// used to keep forwarding VR/hand data from the pose interface until planner is ready.
     bool switch_from_teleop_to_planner_ = false;
