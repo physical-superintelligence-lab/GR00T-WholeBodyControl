@@ -104,6 +104,12 @@ ADDR_TORQUE_ENABLE    = 64
 ADDR_GOAL_POSITION    = 116
 ADDR_PRESENT_POSITION = 132
 ADDR_HW_ERROR_STATUS  = 70
+COMM_SUCCESS          = 0
+# Hardware Error Status (addr 70) bits, Dynamixel X-series.
+NECK_HW_ERROR_BITS    = {0: "input voltage", 2: "overheating", 3: "motor encoder",
+                         4: "electrical shock", 5: "overload"}
+NECK_LOG_INTERVAL_S   = 2.0    # min seconds between repeats of the same neck error log
+NECK_STATS_INTERVAL_S = 5.0
 TICKS_PER_REV         = 4096
 
 
@@ -531,6 +537,20 @@ class NeckMotor:
         self._pose_sub = None
         self._state_pub = None
         self._zmq_ctx = None
+        self._last_log: dict = {}
+        self._reboot_count = {yaw_id: 0, pitch_id: 0}
+
+    def _log(self, key: str, msg: str, color: str = "91") -> None:
+        """Print msg (red by default) at most once per NECK_LOG_INTERVAL_S per key."""
+        now = time.time()
+        if now - self._last_log.get(key, 0.0) >= NECK_LOG_INTERVAL_S:
+            self._last_log[key] = now
+            print(f"\033[{color}m{msg}\033[0m")
+
+    @staticmethod
+    def _decode_hw_error(hw: int) -> str:
+        names = [name for bit, name in NECK_HW_ERROR_BITS.items() if hw & (1 << bit)]
+        return ", ".join(names) if names else "none"
 
     @staticmethod
     def _rad_to_tick(rad: float, zero_tick: int) -> int:
@@ -545,16 +565,47 @@ class NeckMotor:
         return max(lo, min(hi, x))
 
     def _check_and_reboot(self, motor_id: int) -> bool:
-        hw, _, err = self._packet.read1ByteTxRx(
+        hw, res, err = self._packet.read1ByteTxRx(
             self._port, motor_id, ADDR_HW_ERROR_STATUS
         )
+        if res != COMM_SUCCESS:
+            self._log(
+                f"hwcheck{motor_id}",
+                f"[Neck][ERROR] ID {motor_id} hardware-error check failed: "
+                f"{self._packet.getTxRxResult(res)}",
+            )
+            return False
         if err == 128 or hw != 0:
-            print(f"[Neck] ID {motor_id} hw_error=0b{hw:08b} -> rebooting")
-            self._packet.reboot(self._port, motor_id)
+            self._reboot_count[motor_id] = self._reboot_count.get(motor_id, 0) + 1
+            print(
+                f"\033[91m[Neck][ERROR] ID {motor_id} hw_error=0b{hw:08b} "
+                f"({self._decode_hw_error(hw)}) -> rebooting "
+                f"(reboot #{self._reboot_count[motor_id]})\033[0m"
+            )
+            reboot_res, _ = self._packet.reboot(self._port, motor_id)
+            if reboot_res != COMM_SUCCESS:
+                print(
+                    f"\033[91m[Neck][ERROR] ID {motor_id} reboot failed: "
+                    f"{self._packet.getTxRxResult(reboot_res)}\033[0m"
+                )
             time.sleep(0.5)
-            self._packet.write1ByteTxRx(
+            torque_res, torque_err = self._packet.write1ByteTxRx(
                 self._port, motor_id, ADDR_TORQUE_ENABLE, 1
             )
+            if torque_res != COMM_SUCCESS or torque_err != 0:
+                print(
+                    f"\033[91m[Neck][ERROR] ID {motor_id} torque re-enable after reboot "
+                    f"failed: {self._packet.getTxRxResult(torque_res)} "
+                    f"{self._packet.getRxPacketError(torque_err)}\033[0m"
+                )
+            else:
+                hw_after, _, _ = self._packet.read1ByteTxRx(
+                    self._port, motor_id, ADDR_HW_ERROR_STATUS
+                )
+                print(
+                    f"[Neck] ID {motor_id} rebooted, torque on, "
+                    f"hw_error now 0b{hw_after:08b} ({self._decode_hw_error(hw_after)})"
+                )
             return True
         return False
 
@@ -655,19 +706,41 @@ class NeckMotor:
         if self._packet is None or self._port is None:
             return None, None
         try:
-            yaw_tick, _, yerr = self._packet.read4ByteTxRx(
+            yaw_tick, yres, yerr = self._packet.read4ByteTxRx(
                 self._port, self.yaw_id, ADDR_PRESENT_POSITION
             )
-            pitch_tick, _, perr = self._packet.read4ByteTxRx(
+            pitch_tick, pres, perr = self._packet.read4ByteTxRx(
                 self._port, self.pitch_id, ADDR_PRESENT_POSITION
             )
-            if yerr != 0 or perr != 0:
+            ok = True
+            for name, motor_id, res, err in (
+                ("yaw", self.yaw_id, yres, yerr), ("pitch", self.pitch_id, pres, perr)
+            ):
+                if res != COMM_SUCCESS:
+                    # On a comm failure the SDK returns tick 0 with error 0; never
+                    # publish that as a position.
+                    ok = False
+                    self._log(
+                        f"read{motor_id}",
+                        f"[Neck][ERROR] {name} (ID {motor_id}) present-position read failed: "
+                        f"{self._packet.getTxRxResult(res)}; neck state not published",
+                    )
+                elif err != 0:
+                    ok = False
+                    self._log(
+                        f"read{motor_id}",
+                        f"[Neck][ERROR] {name} (ID {motor_id}) present-position read returned "
+                        f"error 0x{err:02x} ({self._packet.getRxPacketError(err)}); "
+                        "neck state not published",
+                    )
+            if not ok:
                 return None, None
             return (
                 self._tick_to_rad(yaw_tick, self.yaw_zero_tick),
                 self._tick_to_rad(pitch_tick, self.pitch_zero_tick),
             )
-        except Exception:
+        except Exception as e:
+            self._log("read_exc", f"[Neck][ERROR] present-position read raised: {e!r}")
             return None, None
         
         
@@ -696,10 +769,14 @@ class NeckMotor:
         last_status_print = 0.0
         last_warn_print = 0.0
         pose_valid = False
+        pose_ever = False
         next_tick = time.time()
+        stats_t0 = time.time()
+        stats = {"published": 0, "read_fail": 0, "write_fail": 0, "overrun": 0}
 
         while self._running:
             next_tick += dt
+            loop_start = time.time()
 
             # Read SMPL-X-derived neck angles from the ZMQ publisher.
             yaw_target = yaw_cmd
@@ -730,7 +807,28 @@ class NeckMotor:
                 yaw_target = yaw_cmd
                 pitch_target = pitch_cmd
             else:
+                if not pose_valid:
+                    print(
+                        f"\033[92m[Neck] neck data {'resumed' if pose_ever else 'received'} "
+                        f"from {self.pose_zmq_addr}\033[0m"
+                    )
                 pose_valid = True
+                pose_ever = True
+
+            if abs(yaw_target) > self.yaw_limit_rad:
+                self._log(
+                    "clamp_yaw",
+                    f"[Neck] yaw command {math.degrees(yaw_target):+.1f}° clamped to "
+                    f"±{math.degrees(self.yaw_limit_rad):.0f}°",
+                    color="93",
+                )
+            if abs(pitch_target) > self.pitch_limit_rad:
+                self._log(
+                    "clamp_pitch",
+                    f"[Neck] pitch command {math.degrees(pitch_target):+.1f}° clamped to "
+                    f"±{math.degrees(self.pitch_limit_rad):.0f}°",
+                    color="93",
+                )
 
             # Clamp
             yaw_target = self._clamp(
@@ -747,14 +845,23 @@ class NeckMotor:
             yaw_tick = self._rad_to_tick(yaw_cmd, self.yaw_zero_tick)
             pitch_tick = self._rad_to_tick(pitch_cmd, self.pitch_zero_tick)
             try:
-                self._packet.write4ByteTxRx(
-                    self._port, self.yaw_id, ADDR_GOAL_POSITION, yaw_tick
-                )
-                self._packet.write4ByteTxRx(
-                    self._port, self.pitch_id, ADDR_GOAL_POSITION, pitch_tick
-                )
+                for name, motor_id, tick in (
+                    ("yaw", self.yaw_id, yaw_tick), ("pitch", self.pitch_id, pitch_tick)
+                ):
+                    res, err = self._packet.write4ByteTxRx(
+                        self._port, motor_id, ADDR_GOAL_POSITION, tick
+                    )
+                    if res != COMM_SUCCESS or err != 0:
+                        stats["write_fail"] += 1
+                        self._log(
+                            f"write{motor_id}",
+                            f"[Neck][ERROR] {name} (ID {motor_id}) goal write: "
+                            f"{self._packet.getTxRxResult(res)} "
+                            f"{self._packet.getRxPacketError(err) if err else ''}",
+                        )
             except Exception as e:
-                print(f"[Neck] write error: {e}")
+                stats["write_fail"] += 1
+                self._log("write_exc", f"[Neck][ERROR] goal write raised: {e!r}")
 
             if self._state_pub is not None:
                 yaw_meas, pitch_meas = self._read_present_state()
@@ -763,8 +870,11 @@ class NeckMotor:
                         self._state_pub.send_string(
                             json.dumps([yaw_meas, pitch_meas])
                         )
-                    except Exception:
-                        pass
+                        stats["published"] += 1
+                    except Exception as e:
+                        self._log("pub_exc", f"[Neck][ERROR] state publish raised: {e!r}")
+                else:
+                    stats["read_fail"] += 1
 
             now = time.time()
 
@@ -785,6 +895,33 @@ class NeckMotor:
                     f"{math.degrees(pitch_cmd):+6.1f}° (tick {pitch_tick:4d})"
                 )
                 last_status_print = now
+
+            elapsed = time.time() - loop_start
+            if elapsed > 2 * dt:
+                stats["overrun"] += 1
+                self._log(
+                    "overrun",
+                    f"[Neck] control loop iteration took {elapsed * 1000:.0f} ms "
+                    f"(budget {dt * 1000:.0f} ms)",
+                    color="93",
+                )
+
+            # Problems summary every NECK_STATS_INTERVAL_S (silent when healthy).
+            if now - stats_t0 >= NECK_STATS_INTERVAL_S:
+                if self._state_pub is not None and stats["published"] == 0:
+                    print(
+                        f"\033[91m[Neck][ERROR] no neck state published in the last "
+                        f"{now - stats_t0:.0f}s (read failures: {stats['read_fail']})\033[0m"
+                    )
+                elif stats["read_fail"] or stats["write_fail"] or stats["overrun"]:
+                    print(
+                        f"\033[93m[Neck] last {now - stats_t0:.0f}s: state published "
+                        f"{stats['published']}, read failures {stats['read_fail']}, "
+                        f"write failures {stats['write_fail']}, loop overruns "
+                        f"{stats['overrun']}\033[0m"
+                    )
+                stats_t0 = now
+                stats = {k: 0 for k in stats}
 
             # Sleep
             sleep_s = next_tick - time.time()
