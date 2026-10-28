@@ -31,7 +31,10 @@ def pico_head_to_neck(body_poses_np):
         return None
     spine_rotation, head_rotation = R.from_quat(quats)
 
-    # Head rotation expressed in the spine frame.
+    # Head rotation expressed in the spine frame, decomposed as intrinsic
+    # yaw (vertical y axis) then pitch (the head's own x axis), matching the
+    # yaw-then-pitch neck joints. With yaw as the middle angle ("xyz", as in
+    # GMR) the decomposition is singular at a 90 deg head turn and the pitch flips.
     relative_rotation = spine_rotation.inv() * head_rotation
-    roll, pitch, _yaw = relative_rotation.as_euler("xyz")
-    return -pitch, roll
+    yaw, pitch, _roll = relative_rotation.as_euler("YXZ")
+    return -yaw, pitch
