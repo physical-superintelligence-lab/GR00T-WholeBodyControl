@@ -5,9 +5,10 @@ action row the server pushes back; HttpChunkClient (rtc off) posts to /act, play
 chunk at 30 Hz and holds the measured pose until the next one lands.
 
 Safety, shared by both:
-  * an action executes only if it was computed for the current HLP step: each step
-    change bumps the WM epoch, holds the robot and blocks everything in flight until an
-    observation for the new step has gone out (RTC: version floor; HTTP: exact epoch);
+  * at an HLP step change the robot keeps the previous step's goal until the new one
+    lands; if it has not landed within STEP_GOAL_TIMEOUT, the WM epoch is bumped, the
+    robot holds and everything in flight is blocked until an observation with the new
+    goal has gone out (RTC: version floor; HTTP: exact epoch);
   * state / camera / neck / last observation older than observation_stale_timeout,
     or no WM goal for the current step, holds the robot;
   * holding = publishing the encoder token of the measured pose with the last hands and
@@ -29,6 +30,8 @@ from websocket import WebSocketApp
 from .recording import log_event
 from .robot import (CTRL_DT, EGO_KEY, GOAL_KEY, HAND_DIM, NECK_DIM, TOKEN_DIM, WIRE_DIMS, convert_numpy,
                     numpy_deserialize, numpy_serialize, resize_goal)
+
+STEP_GOAL_TIMEOUT = 2.0  # s
 
 
 @dataclass
@@ -153,7 +156,7 @@ class VlaClientBase:
 
     def set_step(self, step, reason):
         def apply():
-            self.wm.set_task(step)
+            self.wm.set_task(step, keep_goal=not self._holding)
             self._step, self._instruction_hold = step, None
         self._transition(f"step ({reason})", apply)
 
@@ -165,8 +168,9 @@ class VlaClientBase:
 
     def condition_snapshot(self):
         with self._publish_lock, self._action_lock:
-            return {"executing": self._action_floor is not None and not self._holding,
-                    "execution_started_at": self._execution_started_at}
+            started, goal_at = self._execution_started_at, self.wm.snapshot()["task_goal_at"]
+            return {"executing": self._action_floor is not None and not self._holding and goal_at is not None,
+                    "execution_started_at": started if None in (started, goal_at) else max(started, goal_at)}
 
     # ------------------------------------------------------------ observation
 
@@ -201,6 +205,9 @@ class VlaClientBase:
         wm = self.wm.snapshot()
         if wm["expired"]:
             self._hold_and_block(f"WM goal expired ({wm['goal_age']:.1f}s)")
+            return None
+        if wm["goal"] is not None and wm["task_goal_at"] is None and wm["task_age"] > STEP_GOAL_TIMEOUT:
+            self._transition("no goal for the new step", self.wm.drop_kept_goal)
             return None
         if wm["goal"] is None:
             self._hold("waiting for the WM goal of the current step")

@@ -61,8 +61,8 @@ def preflight(args):
         raise RuntimeError("WM /ready did not report ready=true")
     if not args.no_hlp:
         health = robot.get_json(f"http://{args.hlp_host}:{args.hlp_port}/health")
-        if not health.get("hierarchical") or "atomic" not in (health.get("task_levels") or ()):
-            raise RuntimeError(f"HLP server cannot plan at atomic level: {health}")
+        if health.get("status") != "ok":
+            raise RuntimeError(f"HLP /health did not report status ok: {health}")
     print(f"[client] VLA {info['embodiment_tag']} ckpt_{info.get('ckpt_step')} rtc={info['rtc_mode']} "
           f"encoder={enc_version} goal={goal_hw} neck={neck} hlp={not args.no_hlp}", flush=True)
     return info, enc_version, enc_path, goal_hw

@@ -44,6 +44,8 @@ class WmClient:
         self._wake, self._stop = threading.Event(), threading.Event()
         self._thread = None
         self._task = task
+        self._task_at = time.monotonic()
+        self._task_goal_at = None  # when the first goal of the current task landed
         self._epoch = 0
         self._enabled = True
         self._ego = self._ego_at = None
@@ -75,16 +77,29 @@ class WmClient:
         with self._lock:
             age = None if self._goal_at is None else time.monotonic() - self._goal_at
             return {"epoch": self._epoch, "task": self._task, "goal": self._goal, "goal_age": age,
+                    "task_age": time.monotonic() - self._task_at, "task_goal_at": self._task_goal_at,
                     "expired": age is not None and 0 < self.goal_hard_age < age,
                     "generation": self._generation, "error": self._error}
 
-    def set_task(self, text):
-        """New WM prompt under a new epoch; the robot is gated until its goal lands."""
+    def set_task(self, text, keep_goal=False):
+        """New WM prompt. keep_goal: the previous goal stays in use (same epoch) until the
+        new task's first goal lands; otherwise a new epoch gates the robot until then."""
         with self._lock:
+            keep_goal = keep_goal and self._task_goal_at is not None
             self._task, self._enabled = text, True
-            self._invalidate_locked()
+            self._task_at, self._task_goal_at = time.monotonic(), None
+            if keep_goal:
+                self._reset_gate_locked()
+            else:
+                self._invalidate_locked()
         print(f"[wm] task -> {text!r}", flush=True)
         self._wake.set()
+
+    def drop_kept_goal(self):
+        """Drop a kept goal whose replacement has not landed (new epoch)."""
+        with self._lock:
+            if self._goal is not None and self._task_goal_at is None:
+                self._invalidate_locked()
 
     def disable(self):
         """Stop requesting and drop the goal (no current step)."""
@@ -94,7 +109,7 @@ class WmClient:
 
     def _invalidate_locked(self):
         self._epoch += 1
-        self._goal = self._goal_at = None
+        self._goal = self._goal_at = self._task_goal_at = None
         self._reset_gate_locked()
 
     # ------------------------------------------------------------ worker
@@ -153,12 +168,13 @@ class WmClient:
         gray_obs, gray_goal = _gray(ego), _gray(goal)
 
         with self._lock:
-            if epoch != self._epoch:
+            if epoch != self._epoch or task != self._task:
                 decision = "stale"
             else:
                 decision = self._gate_locked(gray_obs, gray_goal)
                 if decision == "accept":
                     self._goal, self._goal_at = goal, time.monotonic()
+                    self._task_goal_at = self._task_goal_at or self._goal_at
                     self._generation += 1
                     self._error = None
             generation, seed = self._generation, self._seed

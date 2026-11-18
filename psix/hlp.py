@@ -1,5 +1,6 @@
-"""Single-task HLP: the planner gets the task sentence at atomic level and proposes one
+"""Single-task HLP: the planner gets the task sentence and proposes one
 step at a time; the current step becomes the WM prompt (the VLA keeps the task).
+When the planner reports the task done, the robot keeps running the current step.
 Operator keys: Enter resumes, p undoes the last step, i types a step, q quits."""
 
 import os
@@ -39,7 +40,7 @@ class HlpClient:
         return reply
 
     def reset(self):
-        return self.request("/reset", {"task": self.task, "hierarchical": True, "level": "atomic"})
+        return self.request("/reset", {"task": self.task})
 
     def poll(self, rgb, executed_revision):
         return self.request("/hlp", {"task": self.task, "executed_revision": executed_revision,
@@ -124,10 +125,10 @@ class StepManager:
         if key == self._key and not force:
             return
         step = planner["instruction"]
-        if step is None:
-            self.client.hold_instructions(planner.get("reason") or "HLP planning")
-        else:
+        if step is not None:
             self.client.set_step(step, reason=source)
+        elif not (planner["done"] and source == "hlp" and self._key and self._key[1]):
+            self.client.hold_instructions(planner.get("reason") or "HLP planning")
         self._key, self._revision, self._done = key, planner["revision"], bool(planner["done"])
         print(f"[hlp] step ({source}) rev={planner['revision']}: {step!r}", flush=True)
         log_event("hlp_step", source=source, step=step, revision=planner["revision"], done=self._done,
@@ -150,7 +151,7 @@ class StepManager:
             if not self._planner:
                 try:
                     self._planner = self.hlp.reset()
-                    print(f"[hlp] episode started: {self.hlp.task!r} (atomic)", flush=True)
+                    print(f"[hlp] episode started: {self.hlp.task!r}", flush=True)
                     log_event("hlp_episode_started", task=self.hlp.task, reply=self._planner)
                 except RuntimeError as exc:
                     self._fail(exc)
